@@ -1,0 +1,2 @@
+# AstrBot already supplies aiohttp; declare the plugin's direct dependency.
+aiohttp>=3.9,<4

@@ -1,0 +1,89 @@
+{
+  "mode": {
+    "description": "运行模式：off 关闭；observe 只记录判断；reply 允许主动回复",
+    "type": "string",
+    "default": "observe",
+    "options": [
+      "off",
+      "observe",
+      "reply"
+    ]
+  },
+  "allowed_groups": {
+    "description": "允许的群，格式 平台实例ID:群ID。空列表不启用任何群，用 /主动回复状态 查看配置值",
+    "type": "list",
+    "default": []
+  },
+  "endpoint": {
+    "description": "完整 SystemOne 地址，不是 /chat/completions",
+    "type": "string",
+    "default": "http://127.0.0.1:8080/v1/systemone"
+  },
+  "api_key": {
+    "description": "3067 API Key；留空则读取环境变量 FASTBRAIN_API_KEY，未配置时匿名访问",
+    "type": "string",
+    "default": ""
+  },
+  "model": {
+    "description": "FastBrain 模型别名",
+    "type": "string",
+    "default": "FastBrain-9B"
+  },
+  "threshold": {
+    "description": "True 概率阈值。0.5 保守；之前 0.11 仅为实验值，不是质量保证",
+    "type": "float",
+    "default": 0.5
+  },
+  "decision_persona": {
+    "description": "判断用精简人格；实际回复继续使用会话人格。请随会话人格同步调整",
+    "type": "text",
+    "default": "我是睦头，安静、简短、克制。优先旁听，不抢群友的话；需要我参与时才自然接话。"
+  },
+  "fewshot": {
+    "description": "附加六个简短示例（默认关；之前没有证明稳定提升）",
+    "type": "bool",
+    "default": false
+  },
+  "bot_names": {
+    "description": "明确以这些名字开头的消息不走主动判断，留给原有唤醒规则",
+    "type": "list",
+    "default": [
+      "睦头"
+    ]
+  },
+  "cooldown_seconds": {
+    "description": "主动判断为 True 或机器人应答后的冷却秒数，最少 1",
+    "type": "int",
+    "default": 120
+  },
+  "check_interval_seconds": {
+    "description": "每群两次判断最短间隔秒数，不排队补判",
+    "type": "int",
+    "default": 10
+  },
+  "timeout_seconds": {
+    "description": "FastBrain 请求总超时秒数（1–60）",
+    "type": "int",
+    "default": 15
+  },
+  "context_ttl_seconds": {
+    "description": "群聊内存缓冲有效秒数（10–86400）",
+    "type": "int",
+    "default": 1800
+  },
+  "max_messages": {
+    "description": "每群最多缓冲消息数（1–100），发给模型时还按字节预算裁剪",
+    "type": "int",
+    "default": 80
+  },
+  "max_groups": {
+    "description": "内存中最多保留群数（1–256）",
+    "type": "int",
+    "default": 64
+  },
+  "max_request_bytes": {
+    "description": "完整判断请求的 UTF-8 字节上限（1024–7168）。适配当前 8192 上下文；旧 4096 服务请设为 3072",
+    "type": "int",
+    "default": 7168
+  }
+}

@@ -1,0 +1,86 @@
+"""SystemOne HTTP client. No retries, redirects, response text or key logging."""
+
+import asyncio
+import json
+import math
+import time
+from email.utils import parsedate_to_datetime
+
+import aiohttp
+
+
+class DecisionError(Exception):
+    def __init__(self, reason: str, retry_after: float = 60) -> None:
+        super().__init__(reason)
+        self.reason, self.retry_after = reason, retry_after
+
+
+def probability(data: object, model: str) -> float:
+    try:
+        if not isinstance(data, dict) or data.get("model") != model:
+            raise ValueError
+        probs = data["answers"]["should_reply"]["probabilities"]
+        values = [probs[k] for k in ("True", "False")]
+        if any(
+            type(x) not in (int, float) or not math.isfinite(x) or not 0 <= x <= 1
+            for x in values
+        ):
+            raise ValueError
+        if abs(sum(values) - 1) > 0.01:
+            raise ValueError
+        return float(values[0])
+    except (KeyError, TypeError, ValueError):
+        raise DecisionError("invalid_response") from None
+
+
+def retry_delay(value: str | None) -> float:
+    try:
+        seconds = float(value)
+        if math.isfinite(seconds):
+            return max(60, seconds)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return max(60, parsedate_to_datetime(value).timestamp() - time.time())
+    except (TypeError, ValueError, OverflowError):
+        return 60
+
+
+class SystemOneClient:
+    def __init__(self, endpoint: str, api_key: str, timeout: float) -> None:
+        self.endpoint, self._api_key, self.timeout = endpoint, api_key, timeout
+        self._session = None
+
+    async def decide(self, payload: dict) -> float:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.timeout)
+            )
+        headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
+        try:
+            async with self._session.post(
+                self.endpoint, json=payload, headers=headers, allow_redirects=False
+            ) as response:
+                if response.status != 200:
+                    raise DecisionError(
+                        f"http_{response.status}",
+                        retry_delay(response.headers.get("Retry-After")),
+                    )
+                body = bytearray()
+                async for chunk in response.content.iter_chunked(8192):
+                    body.extend(chunk)
+                    if len(body) > 65536:
+                        raise DecisionError("response_too_large")
+                try:
+                    data = json.loads(body)
+                except (ValueError, UnicodeDecodeError):
+                    raise DecisionError("invalid_json") from None
+                return probability(data, str(payload["model"]))
+        except asyncio.TimeoutError:
+            raise DecisionError("timeout") from None
+        except aiohttp.ClientError:
+            raise DecisionError("network") from None
+
+    async def close(self) -> None:
+        if self._session is not None:
+            await self._session.close()
