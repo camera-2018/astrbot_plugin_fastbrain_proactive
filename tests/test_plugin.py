@@ -98,7 +98,6 @@ async def test_positive_uses_native_session_and_temporary_user_content(plugin):
         "passive",
         "image",
         "self",
-        "command",
         "disabled",
         "provider_prefix",
         "other_runner",
@@ -123,8 +122,6 @@ async def test_non_proactive_paths_do_not_wake(plugin, case):
         e = event("", parts=[Image(file="https://invalid/image")])
     if case == "self":
         e = event(sender="bot")
-    if case == "command":
-        e = event("/unknown")
     if case == "disabled":
         plugin.context.get_config("")["provider_settings"]["enable"] = False
     if case == "provider_prefix":
@@ -403,6 +400,9 @@ def test_retry_after_and_setting_validation():
     [
         ("positive", 1),
         ("named_invitation", 1),
+        ("slash_plain", 1),
+        ("bang_plain", 1),
+        ("fullbang_plain", 1),
         ("human_at_positive", 1),
         ("human_quote_positive", 1),
         ("human_at_then_followup", 1),
@@ -482,6 +482,10 @@ async def test_sdk_waking_access_and_process_pipeline(
         "test",
     )
     e = event()
+    if case in {"slash_plain", "bang_plain", "fullbang_plain"}:
+        config["wake_prefix"] = ["睦头"]
+        prefix = {"slash_plain": "/", "bang_plain": "!", "fullbang_plain": "！"}[case]
+        e = event(prefix + "机器人也来聊聊")
     if case == "named_invitation":
         e = event("睦头你也来聊聊")
     if case == "human_at_positive":
@@ -890,3 +894,15 @@ async def test_unknown_quote_and_atall_preserve_available_context(plugin):
     assert target["mentions"] == ["all"]
     assert target["reply_to"]["speaker"] == "unknown"
     assert target["reply_to"]["text"] == "某人建议机器人也来参与"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix", ["/", "!", "！"])
+async def test_unhandled_prefix_reaches_fastbrain_intact(plugin, prefix):
+    e = event(prefix + "机器人也来聊聊")
+    await plugin.collect(e)
+    await plugin.judge(e)
+    plugin.client.decide.assert_awaited_once()
+    target = json.loads(plugin.client.decide.await_args.args[0]["state"])["target"]
+    assert target["text"] == prefix + "机器人也来聊聊"
+    assert e.get_extra(DECISION)

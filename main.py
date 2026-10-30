@@ -86,7 +86,6 @@ class FastBrainProactive(Star):
             and len(text.encode("utf-8")) <= self.cfg.max_bytes
             and not event.is_at_or_wake_command
             and not own
-            and not text.startswith(("/", "!", "！"))
         )
         event.set_extra(
             SEEN,
