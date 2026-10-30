@@ -75,14 +75,10 @@ class FastBrainProactive(Star):
             return
         directed = any(isinstance(c, (At, AtAll, Reply)) for c in event.get_messages())
         self_id = str(event.get_self_id())
-        addressed_to_bot = (
-            event.is_at_or_wake_command
-            or any(text.startswith(name) for name in self.cfg.names)
-            or any(
-                (isinstance(c, At) and str(c.qq) == self_id)
-                or (isinstance(c, Reply) and str(c.sender_id) == self_id)
-                for c in event.get_messages()
-            )
+        addressed_to_bot = event.is_at_or_wake_command or any(
+            (isinstance(c, At) and str(c.qq) == self_id)
+            or (isinstance(c, Reply) and str(c.sender_id) == self_id)
+            for c in event.get_messages()
         )
         # Human-to-human @/quotes are not proactive targets, but must not
         # postpone decisions on subsequent ordinary messages in the whole group.

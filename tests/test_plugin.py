@@ -100,7 +100,6 @@ async def test_positive_uses_native_session_and_temporary_user_content(plugin):
         "image",
         "self",
         "command",
-        "named",
         "disabled",
         "provider_prefix",
         "other_runner",
@@ -129,8 +128,6 @@ async def test_non_proactive_paths_do_not_wake(plugin, case):
         e = event(sender="bot")
     if case == "command":
         e = event("/unknown")
-    if case == "named":
-        e = event("睦头帮我看看")
     if case == "disabled":
         plugin.context.get_config("")["provider_settings"]["enable"] = False
     if case == "provider_prefix":
@@ -391,6 +388,7 @@ def test_retry_after_and_setting_validation():
     "case,expected",
     [
         ("positive", 1),
+        ("named_invitation", 1),
         ("human_at_then_followup", 1),
         ("human_quote_then_followup", 1),
         ("negative", 0),
@@ -468,6 +466,8 @@ async def test_sdk_waking_access_and_process_pipeline(
         "test",
     )
     e = event()
+    if case == "named_invitation":
+        e = event("睦头你也来聊聊")
     if case == "negative":
         plugin.client.decide.return_value = 0.01
     if case == "passive":
@@ -521,7 +521,7 @@ async def test_sdk_waking_access_and_process_pipeline(
                 if e.get_result():
                     outputs.append(e.get_result())
     assert len(generated) == expected
-    if case == "positive":
+    if case in {"positive", "named_invitation"}:
         assert len(generated[0].extra_user_content_parts) == 1
     if case == "passive":
         plugin.client.decide.assert_not_awaited()
@@ -648,3 +648,24 @@ async def test_reply_cooldown_expires_despite_repeated_human_quotes(plugin):
 def test_cooldown_default_and_existing_custom_values():
     assert Settings.read({}).cooldown == 30
     assert Settings.read({"cooldown_seconds": 120}).cooldown == 120
+
+
+@pytest.mark.asyncio
+async def test_unhandled_named_invitation_reaches_classifier(plugin):
+    e = event("睦头帮我看看")
+    await plugin.collect(e)
+    await plugin.judge(e)
+    plugin.client.decide.assert_awaited_once()
+    assert e.get_extra(DECISION)
+    payload = plugin.client.decide.await_args.args[0]
+    assert json.loads(payload["state"])["bot_names"] == ["睦头"]
+
+
+@pytest.mark.asyncio
+async def test_core_woken_named_invitation_is_not_handled_twice(plugin):
+    e = event("睦头帮我看看")
+    e.is_at_or_wake_command = True
+    await plugin.collect(e)
+    await plugin.judge(e)
+    plugin.client.decide.assert_not_awaited()
+    assert not e.get_extra(DECISION)
