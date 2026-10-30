@@ -697,7 +697,7 @@ async def test_unhandled_named_invitation_reaches_classifier(plugin):
     plugin.client.decide.assert_awaited_once()
     assert e.get_extra(DECISION)
     payload = plugin.client.decide.await_args.args[0]
-    assert json.loads(payload["state"])["bot_names"] == ["睦头"]
+    assert json.loads(payload["state"])["bot_names"] == ["睦头", "木头"]
 
 
 @pytest.mark.asyncio
@@ -906,3 +906,98 @@ async def test_unhandled_prefix_reaches_fastbrain_intact(plugin, prefix):
     target = json.loads(plugin.client.decide.await_args.args[0]["state"])["target"]
     assert target["text"] == prefix + "机器人也来聊聊"
     assert e.get_extra(DECISION)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "probability,action", [(0.9, "reply_cooldown"), (0.1, "silent")]
+)
+async def test_dataset_captures_model_not_actual_speech(
+    plugin, tmp_path, probability, action
+):
+    from astrbot_plugin_fastbrain_proactive.dataset import Dataset
+
+    plugin.dataset = Dataset(tmp_path, 1)
+    plugin.client.decide.return_value = probability
+    e = event("木头查下明天的安排")
+    await plugin.collect(e)
+    plugin.rooms.get(plugin.key(e)).cooldown_until = 1100
+    await plugin.judge(e)
+    with plugin.dataset.connect() as c:
+        training, audit = c.execute("SELECT training,audit FROM samples").fetchone()
+    assert json.loads(training)["label"] == (probability >= 0.5)
+    assert json.loads(audit)["action"] == action
+    assert not e.is_at_or_wake_command
+
+
+@pytest.mark.asyncio
+async def test_dataset_failure_does_not_fail_chat_or_backoff(
+    plugin, tmp_path, monkeypatch
+):
+    from astrbot_plugin_fastbrain_proactive.dataset import Dataset
+
+    plugin.dataset = Dataset(tmp_path, 1)
+
+    def fail(**kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(plugin.dataset, "record", fail)
+    e = event()
+    await plugin.collect(e)
+    await plugin.judge(e)
+    assert e.is_at_or_wake_command and plugin.blocked_until == 0
+    assert plugin.dataset_error == "OSError"
+
+
+@pytest.mark.asyncio
+async def test_failed_model_is_not_false_label(plugin, tmp_path):
+    from astrbot_plugin_fastbrain_proactive.dataset import Dataset
+
+    plugin.dataset = Dataset(tmp_path, 1)
+    plugin.client.decide.side_effect = DecisionError("unavailable", 60)
+    e = event()
+    await plugin.collect(e)
+    await plugin.judge(e)
+    with plugin.dataset.connect() as c:
+        assert c.execute("SELECT COUNT(*) FROM observed").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_expired_model_result_still_saved(plugin, tmp_path):
+    from astrbot_plugin_fastbrain_proactive.dataset import Dataset
+
+    plugin.dataset = Dataset(tmp_path, 1)
+
+    async def decide(payload):
+        plugin.clock = lambda: 1031.0
+        return 0.9
+
+    plugin.client.decide = decide
+    e = event()
+    await plugin.collect(e)
+    await plugin.judge(e)
+    with plugin.dataset.connect() as c:
+        audit = json.loads(c.execute("SELECT audit FROM samples").fetchone()[0])
+    assert audit["action"] == "decision_expired" and audit["decision"] is True
+    assert not e.is_at_or_wake_command
+
+
+@pytest.mark.asyncio
+async def test_dataset_outcome_once_and_private_context(plugin, tmp_path):
+    from astrbot_plugin_fastbrain_proactive.dataset import Dataset
+
+    plugin.dataset = Dataset(tmp_path, 1)
+    e = event()
+    await plugin.collect(e)
+    await plugin.judge(e)
+    await plugin.prepare_reply(e, ProviderRequest())
+    await plugin.prepare_reply(e, ProviderRequest())
+    e._has_send_oper = True
+    await plugin.after_sent(e)
+    await plugin.after_sent(e)
+    lines = [
+        json.loads(line)
+        for f in (tmp_path / "audit").glob("outcomes-*.jsonl")
+        for line in f.read_text().splitlines()
+    ]
+    assert [x["phase"] for x in lines] == ["generation_started", "send_hook_observed"]

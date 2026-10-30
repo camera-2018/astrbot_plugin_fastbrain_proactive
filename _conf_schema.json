@@ -40,7 +40,7 @@
     "default": "我是睦头，简短自然地参与群聊。有人邀请我、接我的话，或话题确有值得补充的内容时主动接话；不必等别人@，也不要求我先前说过话。不抢群友之间的定向交流，不无意义刷屏。"
   },
   "fewshot": {
-    "description": "附加十二个简短正反例（邀请、询问机器人、提名互动、普通提及及定向交流）",
+    "description": "附加十八个简短正反例（邀请、提名交办、引用中交办、普通提及及定向交流）",
     "type": "bool",
     "default": false
   },
@@ -48,7 +48,8 @@
     "description": "供判断器识别机器人的名字；只有核心实际唤醒时才交给被动回复，不单凭名字开头排除",
     "type": "list",
     "default": [
-      "睦头"
+      "睦头",
+      "木头"
     ]
   },
   "cooldown_seconds": {
@@ -80,5 +81,15 @@
     "description": "完整判断请求的 UTF-8 字节上限（1024–7168）。适配当前 8192 上下文；旧 4096 服务请设为 3072",
     "type": "int",
     "default": 7168
+  },
+  "dataset_enabled": {
+    "description": "在插件数据目录保存线上银标：True 全量、False 按比例抽样。含可读聊天内容，仅本机保存，不自动上传",
+    "type": "bool",
+    "default": false
+  },
+  "false_sample_rate": {
+    "description": "False 样本保存概率（0–1）；True 始终全量保存",
+    "type": "float",
+    "default": 0.1
   }
 }

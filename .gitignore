@@ -4,3 +4,9 @@ __pycache__/
 .venv/
 *.pyc
 .env
+
+# Local online chat samples and ledgers must never be published.
+online-dataset/
+*.sqlite*
+*.jsonl
+*.jsonl.gz

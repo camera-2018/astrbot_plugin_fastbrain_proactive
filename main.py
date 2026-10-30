@@ -10,12 +10,13 @@ from typing import Any
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.agent.message import TextPart
-from astrbot.core.message.components import At, AtAll, Plain, Reply
+from astrbot.core.message.components import At, AtAll, Image, Plain, Reply
 from astrbot.core.message.message_event_result import MessageEventResult
 from astrbot.core.star.session_llm_manager import SessionServiceManager
 
+from .dataset import Dataset
 from .client import DecisionError, SystemOneClient
 from .engine import Room, Rooms, Settings, build_payload, compact
 
@@ -24,6 +25,7 @@ DECISION = "fastbrain_proactive_decision_v1"
 ANSWER = "fastbrain_proactive_answer_v1"
 SENT = "fastbrain_proactive_sent_v1"
 JUDGED = "fastbrain_proactive_judged_v1"
+SAMPLE = "fastbrain_proactive_sample_v1"
 MAX_DECISION_AGE = 30.0
 
 
@@ -41,6 +43,17 @@ class FastBrainProactive(Star):
         self.decision_slot = asyncio.Semaphore(1)
         self.blocked_until = 0.0
         self.closed = False
+        self.dataset = None
+        self.dataset_error = ""
+        if self.cfg.dataset_enabled:
+            try:
+                self.dataset = Dataset(
+                    StarTools.get_data_dir("astrbot_plugin_fastbrain_proactive")
+                    / "online-dataset",
+                    self.cfg.false_sample_rate,
+                )
+            except Exception as exc:
+                self.capture_error(exc)
 
     @staticmethod
     def scope(event: AstrMessageEvent) -> str:
@@ -75,6 +88,8 @@ class FastBrainProactive(Star):
         mid = str(getattr(event.message_obj, "message_id", "") or "")
         sender = str(event.get_sender_id())
         routing = self.routing(event)
+        has_routing = bool(routing.get("mentions") or routing.get("reply_to"))
+        routing.update({"_id": mid, "_text_truncated": len(text) > self.cfg.max_bytes})
         if not room.add(sender, text or "[无正文文字]", mid, now, self.cfg, routing):
             return
         own = sender == str(event.get_self_id())
@@ -82,7 +97,7 @@ class FastBrainProactive(Star):
             room.cooldown_until = max(room.cooldown_until, now + self.cfg.cooldown)
         # Only actual passive handling excludes an event, not @/reply syntax.
         eligible = (
-            bool(text or routing)
+            bool(text or has_routing)
             and len(text.encode("utf-8")) <= self.cfg.max_bytes
             and not event.is_at_or_wake_command
             and not own
@@ -93,6 +108,7 @@ class FastBrainProactive(Star):
                 "room": room,
                 "eligible": eligible,
                 "created": now,
+                "received_at": time.time(),
                 "rows": tuple(room.messages) if eligible else (),
             },
         )
@@ -100,10 +116,22 @@ class FastBrainProactive(Star):
     @staticmethod
     def routing(event: AstrMessageEvent) -> dict:
         """Use adapter-provided quote text only; never fetch media or remote history."""
-        result = {}
+        result = {"_images": 0, "_media": []}
         mentions = []
         for part in event.get_messages():
-            if isinstance(part, AtAll):
+            if isinstance(part, Image):
+                result["_images"] += 1
+            elif type(part).__name__ in {
+                "Record",
+                "Video",
+                "File",
+                "Face",
+                "Forward",
+                "Node",
+                "Nodes",
+            }:
+                result["_media"].append(type(part).__name__.lower())
+            elif isinstance(part, AtAll):
                 mentions.append("all")
             elif isinstance(part, At):
                 mentions.append(str(part.qq)[:128])
@@ -117,6 +145,8 @@ class FastBrainProactive(Star):
                     "speaker": sender,
                     "text": quote[:1024],
                     "truncated": len(quote) > 1024,
+                    "_message_id": str(part.id),
+                    "_time": part.time,
                 }
         if mentions:
             result["mentions"] = list(dict.fromkeys(mentions))[:16]
@@ -160,6 +190,8 @@ class FastBrainProactive(Star):
             return
         queued = self.clock()
         acquired = False
+        p = None
+        action = "interrupted_after_decision"
         try:
             if queued < self.blocked_until:
                 self.note_skip(event, room, "error_backoff")
@@ -180,12 +212,15 @@ class FastBrainProactive(Star):
                 self.note_skip(event, room, "error_backoff")
                 return
             p = await self.client.decide(payload)
+            finished = self.clock()
             if not self.valid(event, room):
-                self.note_skip(event, room, "cancelled_or_handled")
+                action = "cancelled_or_handled"
+                self.note_skip(event, room, action)
                 return
             now = self.clock()
             if now - captured["created"] >= MAX_DECISION_AGE:
-                self.note_skip(event, room, "decision_expired")
+                action = "decision_expired"
+                self.note_skip(event, room, action)
                 return
             accepted = p >= self.cfg.threshold
             action = "silent"
@@ -242,6 +277,42 @@ class FastBrainProactive(Star):
         finally:
             if acquired:
                 self.decision_slot.release()
+            if p is not None and self.dataset is not None:
+                try:
+                    rid = await asyncio.to_thread(
+                        self.dataset.record,
+                        scope=self.scope(event),
+                        self_id=str(event.get_self_id()),
+                        message_id=str(event.message_obj.message_id or ""),
+                        received_at=captured["received_at"],
+                        rows=captured["rows"],
+                        payload=payload,
+                        p_true=p,
+                        threshold=self.cfg.threshold,
+                        action=action,
+                        elapsed_ms=round((finished - started) * 1000),
+                        queue_ms=round((started - queued) * 1000),
+                    )
+                    event.set_extra(SAMPLE, rid)
+                    self.dataset_error = ""
+                except Exception as exc:
+                    self.capture_error(exc)
+
+    def capture_error(self, exc):
+        self.dataset_error = type(exc).__name__
+        logger.error(
+            "FastBrain dataset write failed: %s (chat continues)", self.dataset_error
+        )
+
+    async def capture_outcome(self, event, phase):
+        rid = event.get_extra(SAMPLE)
+        key = SAMPLE + ":" + phase
+        if self.dataset is not None and rid and not event.get_extra(key):
+            try:
+                await asyncio.to_thread(self.dataset.outcome, rid, phase)
+                event.set_extra(key, True)
+            except Exception as exc:
+                self.capture_error(exc)
 
     def note_skip(self, event: AstrMessageEvent, room: Room, reason: str) -> None:
         room.last = {"status": reason}
@@ -287,6 +358,7 @@ class FastBrainProactive(Star):
             if room.pending_owner == id(event):
                 room.pending_until = 0
             room.last = {"status": "stale_before_generation"}
+            await self.capture_outcome(event, "stale_before_generation")
             event.stop_event()
             return
         # Per-turn, temporary user content: stable system prompt and history stay intact.
@@ -301,6 +373,7 @@ class FastBrainProactive(Star):
             ).mark_as_temp()
         )
         decision["injected"] = True
+        await self.capture_outcome(event, "generation_started")
 
     @filter.on_agent_done()
     async def remember_answer(
@@ -317,9 +390,11 @@ class FastBrainProactive(Star):
         text = getattr(response, "completion_text", "")
         if text:
             event.set_extra(ANSWER, text[: self.cfg.max_bytes])
+        await self.capture_outcome(event, "generation_completed")
         # Streaming responses may already have been sent before this hook.
         if event._has_send_oper:
             self.record_sent(event)
+            await self.capture_outcome(event, "send_hook_observed")
 
     def record_sent(self, event: AstrMessageEvent) -> None:
         if (
@@ -345,6 +420,8 @@ class FastBrainProactive(Star):
     @filter.after_message_sent()
     async def after_sent(self, event: AstrMessageEvent) -> None:
         self.record_sent(event)
+        if event._has_send_oper:
+            await self.capture_outcome(event, "send_hook_observed")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("主动回复状态")
@@ -358,7 +435,8 @@ class FastBrainProactive(Star):
             f"FastBrain 主动回复：{self.cfg.mode}\n"
             f"群配置值：{self.scope(event)}\nUMO：{event.unified_msg_origin}\n"
             f"本群启用：{self.allowed(event)}；阈值：{self.cfg.threshold}\n"
-            f"上下文：{len(room.messages) if room else 0} 条；最近判断：{last}"
+            f"上下文：{len(room.messages) if room else 0} 条；最近判断：{last}\n"
+            f"数据集：{bool(self.dataset)}；False 抽样：{self.cfg.false_sample_rate:.0%}；写入错误：{self.dataset_error or '无'}"
         )
         event.stop_event()
 
