@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 from aiohttp import web
 from astrbot.api.provider import ProviderRequest
-from astrbot.core.message.components import At, Image, Plain
+from astrbot.core.message.components import At, AtAll, Image, Plain, Reply
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
 from astrbot.core.platform.message_type import MessageType
@@ -391,6 +391,8 @@ def test_retry_after_and_setting_validation():
     "case,expected",
     [
         ("positive", 1),
+        ("human_at_then_followup", 1),
+        ("human_quote_then_followup", 1),
         ("negative", 0),
         ("passive", 1),
         ("whitelist_denied", 0),
@@ -488,26 +490,36 @@ async def test_sdk_waking_access_and_process_pipeline(
             if False:
                 yield
 
-    stages = [WakingCheckStage(), WhitelistCheckStage(), SessionStatusCheckStage()]
-    for stage in stages:
-        await stage.initialize(ctx)
-        result = stage.process(e)
-        if inspect.isasyncgen(result):
-            async for _ in result:
-                pass
-        else:
-            await result
-        if e.is_stopped():
-            break
-    if not e.is_stopped():
-        process = ProcessStage()
-        process.ctx = ctx
-        process.star_request_sub_stage = StarRequestSubStage()
-        await process.star_request_sub_stage.initialize(ctx)
-        process.agent_sub_stage = AgentSpy()
-        async for _ in process.process(e):
-            if e.get_result():
-                outputs.append(e.get_result())
+    incoming = [e]
+    if case in {"human_at_then_followup", "human_quote_then_followup"}:
+        part = (
+            At(qq="other")
+            if case == "human_at_then_followup"
+            else Reply(id="q", sender_id="other")
+        )
+        incoming.insert(0, event(mid="human", parts=[part, Plain("拼豆仙人")]))
+    for current in incoming:
+        e = current
+        stages = [WakingCheckStage(), WhitelistCheckStage(), SessionStatusCheckStage()]
+        for stage in stages:
+            await stage.initialize(ctx)
+            result = stage.process(e)
+            if inspect.isasyncgen(result):
+                async for _ in result:
+                    pass
+            else:
+                await result
+            if e.is_stopped():
+                break
+        if not e.is_stopped():
+            process = ProcessStage()
+            process.ctx = ctx
+            process.star_request_sub_stage = StarRequestSubStage()
+            await process.star_request_sub_stage.initialize(ctx)
+            process.agent_sub_stage = AgentSpy()
+            async for _ in process.process(e):
+                if e.get_result():
+                    outputs.append(e.get_result())
     assert len(generated) == expected
     if case == "positive":
         assert len(generated[0].extra_user_content_parts) == 1
@@ -569,3 +581,70 @@ def test_extended_budget_keeps_long_target_intact_and_retains_more_context():
     assert json.loads(state)["target"]["text"] == target
     with pytest.raises(ValueError):
         build_payload(short, room, "b")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "part",
+    [At(qq="other"), Reply(id="quote", sender_id="other"), Reply(id="quote"), AtAll()],
+)
+async def test_human_directed_messages_do_not_start_group_cooldown(plugin, part):
+    human = event(mid="human", parts=[part, Plain("拼豆仙人")])
+    await plugin.collect(human)
+    await plugin.judge(human)
+    room = plugin.rooms.items[plugin.key(human)]
+    assert room.cooldown_until == 0
+    plugin.client.decide.assert_not_awaited()
+    plugin.clock = lambda: 1008
+    followup = event("我有个小模型，如果生效了你就插话一下", mid="followup")
+    await plugin.collect(followup)
+    await plugin.judge(followup)
+    plugin.client.decide.assert_awaited_once()
+    assert followup.get_extra(DECISION)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("part", [At(qq="bot"), Reply(id="quote", sender_id="bot")])
+async def test_addressed_to_bot_still_starts_cooldown(plugin, part):
+    e = event(parts=[part, Plain("请回答")])
+    await plugin.collect(e)
+    await plugin.judge(e)
+    assert plugin.rooms.items[plugin.key(e)].cooldown_until == 1030
+    plugin.client.decide.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reply_cooldown_expires_despite_repeated_human_quotes(plugin):
+    e = event("睦头你好")
+    e.is_at_or_wake_command = True
+    await plugin.collect(e)
+    await plugin.prepare_reply(e, ProviderRequest())
+    plugin.clock = lambda: 1005
+    e._has_send_oper = True
+    await plugin.remember_answer(e, None, SimpleNamespace(completion_text="我在"))
+    room = plugin.rooms.items[plugin.key(e)]
+    assert room.cooldown_until == 1035 and room.pending_until == 0
+    for tick in (1010, 1020, 1034):
+        plugin.clock = lambda tick=tick: tick
+        other = event(
+            mid=str(tick),
+            parts=[Reply(id="old", sender_id="human"), At(qq="human"), Plain("聊几句")],
+        )
+        await plugin.collect(other)
+        await plugin.judge(other)
+        assert room.cooldown_until == 1035
+    ordinary = event(mid="before-expiry")
+    await plugin.collect(ordinary)
+    await plugin.judge(ordinary)
+    plugin.client.decide.assert_not_awaited()
+    assert room.last["status"] == "cooldown" and room.last["remaining_seconds"] == 1
+    plugin.clock = lambda: 1035
+    ready = event(mid="expired")
+    await plugin.collect(ready)
+    await plugin.judge(ready)
+    plugin.client.decide.assert_awaited_once()
+
+
+def test_cooldown_default_and_existing_custom_values():
+    assert Settings.read({}).cooldown == 30
+    assert Settings.read({"cooldown_seconds": 120}).cooldown == 120

@@ -74,13 +74,21 @@ class FastBrainProactive(Star):
         if not room.add(sender, text or "[非文字消息，已忽略]", mid, now, self.cfg):
             return
         directed = any(isinstance(c, (At, AtAll, Reply)) for c in event.get_messages())
-        passive = (
+        self_id = str(event.get_self_id())
+        addressed_to_bot = (
             event.is_at_or_wake_command
-            or directed
             or any(text.startswith(name) for name in self.cfg.names)
+            or any(
+                (isinstance(c, At) and str(c.qq) == self_id)
+                or (isinstance(c, Reply) and str(c.sender_id) == self_id)
+                for c in event.get_messages()
+            )
         )
-        own = sender == str(event.get_self_id())
-        if passive or own:
+        # Human-to-human @/quotes are not proactive targets, but must not
+        # postpone decisions on subsequent ordinary messages in the whole group.
+        passive = addressed_to_bot or directed
+        own = sender == self_id
+        if addressed_to_bot or own:
             room.cooldown_until = max(room.cooldown_until, now + self.cfg.cooldown)
         # Keep the decision target intact; do not judge truncated long messages.
         eligible = bool(text) and len(text.encode("utf-8")) <= self.cfg.max_bytes
@@ -117,10 +125,20 @@ class FastBrainProactive(Star):
         now = self.clock()
         if not self.valid(event, room, revision):
             return
+        if now < room.cooldown_until:
+            room.last = {
+                "status": "cooldown",
+                "remaining_seconds": round(room.cooldown_until - now, 2),
+            }
+            logger.debug(
+                "FastBrain proactive skipped: scope=%s reason=cooldown remaining=%.2fs",
+                self.scope(event),
+                room.cooldown_until - now,
+            )
+            return
         if (
             self.busy
             or now < self.blocked_until
-            or now < room.cooldown_until
             or now < room.pending_until
             or now - room.last_check < self.cfg.interval
         ):

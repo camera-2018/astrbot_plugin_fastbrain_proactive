@@ -77,7 +77,7 @@ class Settings:
             model=str(cfg.get("model", "FastBrain-9B")),
             threshold=number("threshold", 0.5, 0, 1),
             timeout=number("timeout_seconds", 15, 1, 60),
-            cooldown=number("cooldown_seconds", 120, 1, 86400),
+            cooldown=number("cooldown_seconds", 30, 1, 86400),
             interval=number("check_interval_seconds", 10, 0, 3600),
             ttl=number("context_ttl_seconds", 1800, 10, 86400),
             max_messages=int(number("max_messages", 80, 1, 100)),

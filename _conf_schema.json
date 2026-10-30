@@ -52,9 +52,9 @@
     ]
   },
   "cooldown_seconds": {
-    "description": "主动判断为 True 或机器人应答后的冷却秒数，最少 1",
+    "description": "主动判断为 True、实际唤醒机器人或机器人应答后的冷却秒数；群友互相 @、引用不刷新，最少 1",
     "type": "int",
-    "default": 120
+    "default": 30
   },
   "check_interval_seconds": {
     "description": "每群两次判断最短间隔秒数，不排队补判",
