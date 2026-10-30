@@ -66,9 +66,9 @@ class Dataset:
     @contextmanager
     def connect(self):
         c = sqlite3.connect(self.db, timeout=2)
-        c.execute("PRAGMA journal_mode=WAL")
-        c.execute("PRAGMA synchronous=FULL")
         try:
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA synchronous=FULL")
             yield c
             c.commit()
         except BaseException:
