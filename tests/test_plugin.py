@@ -669,3 +669,17 @@ async def test_core_woken_named_invitation_is_not_handled_twice(plugin):
     await plugin.judge(e)
     plugin.client.decide.assert_not_awaited()
     assert not e.get_extra(DECISION)
+
+
+def test_fewshot_budget_preserves_target_with_bounded_history():
+    cfg = Settings.read({"fewshot": True})
+    room = Rooms(cfg, lambda: 1000).get(("p", "b", "g"))
+    for i in range(80):
+        room.add("u", f"{i}:" + "历史聊天内容" * 20, str(i), 1000, cfg)
+    room.add("u", "机器人也来发表下意见吧", "target", 1000, cfg)
+    payload, state = build_payload(cfg, room, "b")
+    parsed = json.loads(state)
+    assert len(compact(payload).encode()) <= cfg.max_bytes
+    assert parsed["target"]["text"] == "机器人也来发表下意见吧"
+    assert 0 < len(parsed["history"]) < 79
+    assert parsed["persona"] == cfg.persona
