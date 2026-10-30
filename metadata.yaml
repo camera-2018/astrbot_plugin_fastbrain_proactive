@@ -1,7 +1,7 @@
 name: astrbot_plugin_fastbrain_proactive
 display_name: FastBrain 主动回复
 desc: FastBrain-9B SystemOne 群聊主动回复判断；沿用会话主模型与人格，默认观察模式。
-version: v0.1.6
+version: v0.1.7
 author: camera-2018
 repo: https://github.com/camera-2018/astrbot_plugin_fastbrain_proactive
 astrbot_version: ">=4.29.3,<4.30"
