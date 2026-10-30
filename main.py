@@ -3,6 +3,7 @@
 import asyncio
 import os
 import time
+from collections import deque
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -22,6 +23,8 @@ SEEN = "fastbrain_proactive_seen_v1"
 DECISION = "fastbrain_proactive_decision_v1"
 ANSWER = "fastbrain_proactive_answer_v1"
 SENT = "fastbrain_proactive_sent_v1"
+JUDGED = "fastbrain_proactive_judged_v1"
+MAX_DECISION_AGE = 30.0
 
 
 class FastBrainProactive(Star):
@@ -35,7 +38,7 @@ class FastBrainProactive(Star):
             str(config.get("api_key", "") or os.getenv("FASTBRAIN_API_KEY", "")),
             self.cfg.timeout,
         )
-        self.busy = False
+        self.decision_slot = asyncio.Semaphore(1)
         self.blocked_until = 0.0
         self.closed = False
 
@@ -71,30 +74,54 @@ class FastBrainProactive(Star):
         now = self.clock()
         mid = str(getattr(event.message_obj, "message_id", "") or "")
         sender = str(event.get_sender_id())
-        if not room.add(sender, text or "[非文字消息，已忽略]", mid, now, self.cfg):
+        routing = self.routing(event)
+        if not room.add(sender, text or "[无正文文字]", mid, now, self.cfg, routing):
             return
-        directed = any(isinstance(c, (At, AtAll, Reply)) for c in event.get_messages())
-        self_id = str(event.get_self_id())
-        addressed_to_bot = event.is_at_or_wake_command or any(
-            (isinstance(c, At) and str(c.qq) == self_id)
-            or (isinstance(c, Reply) and str(c.sender_id) == self_id)
-            for c in event.get_messages()
-        )
-        # Human-to-human @/quotes are not proactive targets, but must not
-        # postpone decisions on subsequent ordinary messages in the whole group.
-        passive = addressed_to_bot or directed
-        own = sender == self_id
-        if addressed_to_bot or own:
+        own = sender == str(event.get_self_id())
+        if event.is_at_or_wake_command or own:
             room.cooldown_until = max(room.cooldown_until, now + self.cfg.cooldown)
-        # Keep the decision target intact; do not judge truncated long messages.
-        eligible = bool(text) and len(text.encode("utf-8")) <= self.cfg.max_bytes
+        # Only actual passive handling excludes an event, not @/reply syntax.
         eligible = (
-            eligible
-            and not passive
+            bool(text or routing)
+            and len(text.encode("utf-8")) <= self.cfg.max_bytes
+            and not event.is_at_or_wake_command
             and not own
             and not text.startswith(("/", "!", "！"))
         )
-        event.set_extra(SEEN, (room, room.revision, eligible))
+        event.set_extra(
+            SEEN,
+            {
+                "room": room,
+                "eligible": eligible,
+                "created": now,
+                "rows": tuple(room.messages) if eligible else (),
+            },
+        )
+
+    @staticmethod
+    def routing(event: AstrMessageEvent) -> dict:
+        """Use adapter-provided quote text only; never fetch media or remote history."""
+        result = {}
+        mentions = []
+        for part in event.get_messages():
+            if isinstance(part, AtAll):
+                mentions.append("all")
+            elif isinstance(part, At):
+                mentions.append(str(part.qq)[:128])
+            elif isinstance(part, Reply) and "reply_to" not in result:
+                quote = "".join(
+                    c.text for c in (part.chain or []) if isinstance(c, Plain)
+                )
+                quote = quote or part.message_str or part.text or ""
+                sender = str(part.sender_id or "")[:128]
+                result["reply_to"] = {
+                    "speaker": sender,
+                    "text": quote[:1024],
+                    "truncated": len(quote) > 1024,
+                }
+        if mentions:
+            result["mentions"] = list(dict.fromkeys(mentions))[:16]
+        return result
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=-10000)
     async def judge(self, event: AstrMessageEvent) -> None:
@@ -103,9 +130,14 @@ class FastBrainProactive(Star):
         captured = event.get_extra(SEEN)
         if not captured:
             return
-        room, revision, eligible = captured
-        if not eligible or not self.valid(event, room, revision):
+        room = captured["room"]
+        if (
+            not captured["eligible"]
+            or not self.valid(event, room)
+            or event.get_extra(JUDGED)
+        ):
             return
+        event.set_extra(JUDGED, True)
         cfg = self.context.get_config(event.unified_msg_origin)
         provider = cfg.get("provider_settings", {})
         # Use only the native agent path whose request hook we can guard.
@@ -118,82 +150,110 @@ class FastBrainProactive(Star):
         if not await SessionServiceManager.should_process_llm_request(event):
             room.last = {"status": "session_ai_disabled"}
             return
-        now = self.clock()
-        if not self.valid(event, room, revision):
-            return
-        if now < room.cooldown_until:
-            room.last = {
-                "status": "cooldown",
-                "remaining_seconds": round(room.cooldown_until - now, 2),
-            }
-            logger.debug(
-                "FastBrain proactive skipped: scope=%s reason=cooldown remaining=%.2fs",
-                self.scope(event),
-                room.cooldown_until - now,
-            )
-            return
-        if (
-            self.busy
-            or now < self.blocked_until
-            or now < room.pending_until
-            or now - room.last_check < self.cfg.interval
-        ):
+        if not self.valid(event, room):
             return
         try:
-            payload, state = build_payload(self.cfg, room, str(event.get_self_id()))
+            # Freeze the target and its preceding context before waiting for a slot.
+            snapshot = Room(messages=deque(captured["rows"]))
+            payload, state = build_payload(self.cfg, snapshot, str(event.get_self_id()))
         except ValueError:
-            room.last = {"status": "input_budget"}
+            self.note_skip(event, room, "input_budget")
             return
-        self.busy = True
-        room.last_check = now
+        queued = self.clock()
+        acquired = False
         try:
+            if queued < self.blocked_until:
+                self.note_skip(event, room, "error_backoff")
+                return
+            remaining = MAX_DECISION_AGE - (queued - captured["created"])
+            if remaining <= 0:
+                self.note_skip(event, room, "decision_expired")
+                return
+            await asyncio.wait_for(self.decision_slot.acquire(), timeout=remaining)
+            acquired = True
+            if not self.valid(event, room):
+                return
+            started = self.clock()
+            if started - captured["created"] >= MAX_DECISION_AGE:
+                self.note_skip(event, room, "decision_expired")
+                return
+            if started < self.blocked_until:
+                self.note_skip(event, room, "error_backoff")
+                return
             p = await self.client.decide(payload)
-            if not self.valid(event, room, revision):
-                room.last = {"status": "stale_discarded"}
+            if not self.valid(event, room):
+                self.note_skip(event, room, "cancelled_or_handled")
+                return
+            now = self.clock()
+            if now - captured["created"] >= MAX_DECISION_AGE:
+                self.note_skip(event, room, "decision_expired")
                 return
             accepted = p >= self.cfg.threshold
-            room.last = {
-                "status": "would_reply" if accepted else "silent",
-                "p_true": round(p, 6),
-                "elapsed_ms": round((self.clock() - now) * 1000),
-                "mode": self.cfg.mode,
-            }
+            action = "silent"
             if accepted:
-                room.cooldown_until = self.clock() + self.cfg.cooldown
-                if self.cfg.mode == "reply":
+                if self.cfg.mode == "observe":
+                    action = "would_reply"
+                elif now < room.pending_until:
+                    action = "reply_pending"
+                elif now < room.cooldown_until:
+                    action = "reply_cooldown"
+                else:
+                    action = "reply_reserved"
+                    room.cooldown_until = now + self.cfg.cooldown
+                    room.pending_until = now + 300
+                    room.pending_owner = id(event)
                     event.set_extra(
                         DECISION,
                         {
                             "room": room,
-                            "revision": revision,
                             "state": state,
-                            "created": self.clock(),
+                            "created": now,
                             "injected": False,
                         },
                     )
-                    room.pending_until = self.clock() + 300
-                    room.pending_owner = id(event)
                     event.is_at_or_wake_command = True
-                    # Leave model, persona, session, tools and conversation selection to core.
+            room.last = {
+                "status": action,
+                "p_true": round(p, 6),
+                "elapsed_ms": round((now - started) * 1000),
+                "queue_ms": round((started - queued) * 1000),
+                "mode": self.cfg.mode,
+            }
+            logger.info(
+                "FastBrain proactive decision: scope=%s message_id=%s p_true=%.6f "
+                "inference_ms=%s queue_ms=%s action=%s",
+                self.scope(event),
+                str(event.message_obj.message_id)[:128],
+                p,
+                room.last["elapsed_ms"],
+                room.last["queue_ms"],
+                action,
+            )
+        except asyncio.TimeoutError:
+            self.note_skip(event, room, "queue_timeout")
         except DecisionError as exc:
             self.blocked_until = self.clock() + exc.retry_after
-            room.last = {"status": exc.reason}
-            logger.warning("FastBrain decision skipped (%s)", exc.reason)
+            self.note_skip(event, room, exc.reason)
         except asyncio.CancelledError:
             raise
         except Exception:
             # Never include exception bodies: providers may echo credentials/input.
             self.blocked_until = self.clock() + 60
-            room.last = {"status": "internal_error"}
-            logger.warning("FastBrain decision skipped (internal_error)")
+            self.note_skip(event, room, "internal_error")
         finally:
-            self.busy = False
+            if acquired:
+                self.decision_slot.release()
 
-    def valid(self, event: AstrMessageEvent, room: Room, revision: int) -> bool:
+    def note_skip(self, event: AstrMessageEvent, room: Room, reason: str) -> None:
+        room.last = {"status": reason}
+        logger.debug(
+            "FastBrain proactive skipped: scope=%s reason=%s", self.scope(event), reason
+        )
+
+    def valid(self, event: AstrMessageEvent, room: Room) -> bool:
         return (
             self.allowed(event)
             and self.rooms.items.get(self.key(event)) is room
-            and room.revision == revision
             and not event.is_stopped()
             and not event.is_at_or_wake_command
             and not event.call_llm
@@ -219,7 +279,7 @@ class FastBrainProactive(Star):
         stale = (
             not self.allowed(event)
             or self.rooms.items.get(self.key(event)) is not room
-            or room.revision != decision["revision"]
+            or room.pending_owner != id(event)
             or self.clock() - decision["created"] > 30
             or event.call_llm
             or event._has_send_oper

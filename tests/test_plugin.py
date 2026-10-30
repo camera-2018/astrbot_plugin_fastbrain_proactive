@@ -96,7 +96,6 @@ async def test_positive_uses_native_session_and_temporary_user_content(plugin):
         "observe",
         "unlisted",
         "passive",
-        "other_at",
         "image",
         "self",
         "command",
@@ -120,8 +119,6 @@ async def test_non_proactive_paths_do_not_wake(plugin, case):
         e = event(group="elsewhere")
     if case == "passive":
         e.is_at_or_wake_command = True
-    if case == "other_at":
-        e = event(parts=[At(qq="other"), Plain("hi")])
     if case == "image":
         e = event("", parts=[Image(file="https://invalid/image")])
     if case == "self":
@@ -176,36 +173,50 @@ async def test_session_disabled_and_duplicate_do_not_infer(plugin, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_new_message_invalidates_inflight_and_global_busy_drops(plugin):
+async def test_burst_queues_each_snapshot_and_reserves_only_one_reply(plugin):
     entered, release = asyncio.Event(), asyncio.Event()
+    bodies = []
 
     async def slow(payload):
+        bodies.append(json.loads(payload["state"]))
         entered.set()
         await release.wait()
         return 0.9
 
     plugin.client.decide.side_effect = slow
-    first = event(mid="1")
+    first = event("第一个邀请", mid="1")
     await plugin.collect(first)
     task = asyncio.create_task(plugin.judge(first))
     await entered.wait()
-    second = event(mid="2")
+    second = event("第二个邀请", mid="2")
     await plugin.collect(second)
-    await plugin.judge(second)
+    task2 = asyncio.create_task(plugin.judge(second))
+    await asyncio.sleep(0)
+    assert not task2.done()
     release.set()
-    await task
-    assert not first.is_at_or_wake_command and not second.is_at_or_wake_command
-    assert plugin.client.decide.await_count == 1 and not plugin.busy
+    await asyncio.gather(task, task2)
+    assert first.is_at_or_wake_command and not second.is_at_or_wake_command
+    assert plugin.client.decide.await_count == 2
+    assert not plugin.decision_slot.locked()
+    assert [x["target"]["text"] for x in bodies] == ["第一个邀请", "第二个邀请"]
+    assert not bodies[0]["history"]
+    assert bodies[1]["history"][-1]["text"] == "第一个邀请"
+    assert plugin.rooms.items[plugin.key(first)].last["status"] == "reply_pending"
 
 
 @pytest.mark.asyncio
-async def test_new_message_before_generation_stops_only_own_request(plugin):
+async def test_new_message_before_generation_does_not_stop_request(plugin):
     first = event()
     await plugin.collect(first)
     await plugin.judge(first)
-    await plugin.collect(event(mid="2"))
-    await plugin.prepare_reply(first, ProviderRequest())
-    assert first.is_stopped()
+    await plugin.collect(
+        event(mid="2", parts=[Reply(id="q", sender_id="other"), Plain("新消息")])
+    )
+    req = ProviderRequest()
+    await plugin.prepare_reply(first, req)
+    assert not first.is_stopped()
+    assert len(req.extra_user_content_parts) == 1
+    assert "新消息" not in req.extra_user_content_parts[0].text
 
 
 @pytest.mark.asyncio
@@ -214,7 +225,7 @@ async def test_timeout_and_cancellation_release_global_slot(plugin):
     e = event()
     await plugin.collect(e)
     await plugin.judge(e)
-    assert not e.is_at_or_wake_command and not plugin.busy
+    assert not e.is_at_or_wake_command and not plugin.decision_slot.locked()
     assert plugin.blocked_until == 1060
     another = event(mid="2")
     await plugin.collect(another)
@@ -226,7 +237,7 @@ async def test_timeout_and_cancellation_release_global_slot(plugin):
     await plugin.collect(e)
     with pytest.raises(asyncio.CancelledError):
         await plugin.judge(e)
-    assert not plugin.busy
+    assert not plugin.decision_slot.locked()
 
 
 @pytest.mark.asyncio
@@ -241,12 +252,15 @@ async def test_cooldown_pending_and_group_isolation(plugin):
     e3 = event(mid="3")
     await plugin.collect(e3)
     await plugin.judge(e3)
-    assert plugin.client.decide.await_count == 1  # Generation reservation lasts 300 s.
+    assert (
+        plugin.client.decide.await_count == 3
+    )  # Pending reply blocks speech, not judging.
+    assert not e2.get_extra(DECISION) and not e3.get_extra(DECISION)
     object.__setattr__(plugin.cfg, "groups", frozenset({"qq:g", "qq:g2"}))
     e4 = event(group="g2")
     await plugin.collect(e4)
     await plugin.judge(e4)
-    assert plugin.client.decide.await_count == 2
+    assert plugin.client.decide.await_count == 4
 
 
 @pytest.mark.asyncio
@@ -389,6 +403,8 @@ def test_retry_after_and_setting_validation():
     [
         ("positive", 1),
         ("named_invitation", 1),
+        ("human_at_positive", 1),
+        ("human_quote_positive", 1),
         ("human_at_then_followup", 1),
         ("human_quote_then_followup", 1),
         ("negative", 0),
@@ -468,6 +484,15 @@ async def test_sdk_waking_access_and_process_pipeline(
     e = event()
     if case == "named_invitation":
         e = event("睦头你也来聊聊")
+    if case == "human_at_positive":
+        e = event(parts=[At(qq="friend"), Plain("也请机器人聊聊")])
+    if case == "human_quote_positive":
+        e = event(
+            parts=[
+                Reply(id="q", sender_id="friend", message_str="机器人也来聊聊"),
+                Plain("同意"),
+            ]
+        )
     if case == "negative":
         plugin.client.decide.return_value = 0.01
     if case == "passive":
@@ -498,6 +523,7 @@ async def test_sdk_waking_access_and_process_pipeline(
             else Reply(id="q", sender_id="other")
         )
         incoming.insert(0, event(mid="human", parts=[part, Plain("拼豆仙人")]))
+        plugin.client.decide.side_effect = [0.1, 0.9]
     for current in incoming:
         e = current
         stages = [WakingCheckStage(), WhitelistCheckStage(), SessionStatusCheckStage()]
@@ -521,7 +547,12 @@ async def test_sdk_waking_access_and_process_pipeline(
                 if e.get_result():
                     outputs.append(e.get_result())
     assert len(generated) == expected
-    if case in {"positive", "named_invitation"}:
+    if case in {
+        "positive",
+        "named_invitation",
+        "human_at_positive",
+        "human_quote_positive",
+    }:
         assert len(generated[0].extra_user_content_parts) == 1
     if case == "passive":
         plugin.client.decide.assert_not_awaited()
@@ -589,17 +620,18 @@ def test_extended_budget_keeps_long_target_intact_and_retains_more_context():
     [At(qq="other"), Reply(id="quote", sender_id="other"), Reply(id="quote"), AtAll()],
 )
 async def test_human_directed_messages_do_not_start_group_cooldown(plugin, part):
+    plugin.client.decide.side_effect = [0.1, 0.9]
     human = event(mid="human", parts=[part, Plain("拼豆仙人")])
     await plugin.collect(human)
     await plugin.judge(human)
     room = plugin.rooms.items[plugin.key(human)]
     assert room.cooldown_until == 0
-    plugin.client.decide.assert_not_awaited()
+    plugin.client.decide.assert_awaited_once()
     plugin.clock = lambda: 1008
     followup = event("我有个小模型，如果生效了你就插话一下", mid="followup")
     await plugin.collect(followup)
     await plugin.judge(followup)
-    plugin.client.decide.assert_awaited_once()
+    assert plugin.client.decide.await_count == 2
     assert followup.get_extra(DECISION)
 
 
@@ -607,6 +639,7 @@ async def test_human_directed_messages_do_not_start_group_cooldown(plugin, part)
 @pytest.mark.parametrize("part", [At(qq="bot"), Reply(id="quote", sender_id="bot")])
 async def test_addressed_to_bot_still_starts_cooldown(plugin, part):
     e = event(parts=[part, Plain("请回答")])
+    e.is_at_or_wake_command = True
     await plugin.collect(e)
     await plugin.judge(e)
     assert plugin.rooms.items[plugin.key(e)].cooldown_until == 1030
@@ -636,13 +669,15 @@ async def test_reply_cooldown_expires_despite_repeated_human_quotes(plugin):
     ordinary = event(mid="before-expiry")
     await plugin.collect(ordinary)
     await plugin.judge(ordinary)
-    plugin.client.decide.assert_not_awaited()
-    assert room.last["status"] == "cooldown" and room.last["remaining_seconds"] == 1
+    assert plugin.client.decide.await_count == 4
+    assert room.last["status"] == "reply_cooldown"
+    assert not ordinary.get_extra(DECISION)
     plugin.clock = lambda: 1035
     ready = event(mid="expired")
     await plugin.collect(ready)
     await plugin.judge(ready)
-    plugin.client.decide.assert_awaited_once()
+    assert plugin.client.decide.await_count == 5
+    assert ready.get_extra(DECISION)
 
 
 def test_cooldown_default_and_existing_custom_values():
@@ -683,3 +718,175 @@ def test_fewshot_budget_preserves_target_with_bounded_history():
     assert parsed["target"]["text"] == "机器人也来发表下意见吧"
     assert 0 < len(parsed["history"]) < 79
     assert parsed["persona"] == cfg.persona
+
+
+@pytest.mark.asyncio
+async def test_quote_and_mentions_keep_sender_relationships(plugin):
+    quoted = event(
+        "邀请",
+        parts=[
+            At(qq="friend"),
+            Reply(
+                id="q",
+                sender_id="friend",
+                chain=[Plain("睦头也来聊聊"), Image(file="https://invalid")],
+            ),
+            Plain("你说得对，机器人来吧"),
+        ],
+    )
+    await plugin.collect(quoted)
+    await plugin.judge(quoted)
+    state = json.loads(plugin.client.decide.await_args.args[0]["state"])
+    target = state["target"]
+    assert target["mentions"] == [target["reply_to"]["speaker"]]
+    assert target["speaker"] != target["reply_to"]["speaker"]
+    assert target["reply_to"]["text"] == "睦头也来聊聊"
+    assert target["text"] == "你说得对，机器人来吧"
+    assert "https://invalid" not in json.dumps(state)
+    assert quoted.get_extra(DECISION)
+
+
+@pytest.mark.asyncio
+async def test_unhandled_bot_quote_is_judged_and_unknown_quote_preserved(plugin):
+    e = event(
+        parts=[
+            Reply(id="q", sender_id="bot", message_str="有人来聊聊吗"),
+            Plain("我来了"),
+        ]
+    )
+    await plugin.collect(e)
+    await plugin.judge(e)
+    state = json.loads(plugin.client.decide.await_args.args[0]["state"])
+    assert state["target"]["reply_to"]["speaker"] == "bot"
+    assert e.get_extra(DECISION)
+
+
+@pytest.mark.asyncio
+async def test_zero_interval_even_if_legacy_config_was_ten(plugin):
+    plugin.client.decide.return_value = 0.1
+    for i in range(4):
+        e = event(mid=str(i))
+        await plugin.collect(e)
+        await plugin.judge(e)
+    assert plugin.client.decide.await_count == 4
+    # Duplicate dispatch of one event cannot classify or wake a second time.
+    await plugin.judge(e)
+    assert plugin.client.decide.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_clear_while_queued_cancels_only_old_room(plugin):
+    await plugin.decision_slot.acquire()
+    e = event()
+    await plugin.collect(e)
+    task = asyncio.create_task(plugin.judge(e))
+    await asyncio.sleep(0)
+    plugin.rooms.items.pop(plugin.key(e))
+    plugin.decision_slot.release()
+    await task
+    plugin.client.decide.assert_not_awaited()
+    assert not e.get_extra(DECISION)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_waiter_does_not_release_another_requests_slot(plugin):
+    await plugin.decision_slot.acquire()
+    e = event()
+    await plugin.collect(e)
+    task = asyncio.create_task(plugin.judge(e))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert plugin.decision_slot.locked()
+    plugin.decision_slot.release()
+    another = event(mid="2")
+    await plugin.collect(another)
+    await plugin.judge(another)
+    assert another.get_extra(DECISION)
+
+
+@pytest.mark.asyncio
+async def test_expired_snapshot_and_backoff_do_not_call_model(plugin):
+    e = event()
+    await plugin.collect(e)
+    plugin.clock = lambda: 1031
+    await plugin.judge(e)
+    plugin.client.decide.assert_not_awaited()
+    assert plugin.rooms.items[plugin.key(e)].last["status"] == "decision_expired"
+
+
+@pytest.mark.asyncio
+async def test_passive_reply_takes_reservation_before_proactive_generation(plugin):
+    e = event()
+    await plugin.collect(e)
+    await plugin.judge(e)
+    passive = event(mid="p")
+    passive.is_at_or_wake_command = True
+    await plugin.collect(passive)
+    await plugin.prepare_reply(passive, ProviderRequest())
+    await plugin.prepare_reply(e, ProviderRequest())
+    assert e.is_stopped()
+    assert not passive.is_stopped()
+
+
+@pytest.mark.asyncio
+async def test_image_arriving_during_judgment_keeps_original_target(plugin):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def slow(payload):
+        entered.set()
+        await release.wait()
+        return 0.95
+
+    plugin.client.decide.side_effect = slow
+    first = event("睦头也来聊聊", mid="a")
+    await plugin.collect(first)
+    task = asyncio.create_task(plugin.judge(first))
+    await entered.wait()
+    image = event("", mid="b", parts=[Image(file="https://invalid")])
+    await plugin.collect(image)
+    await plugin.judge(image)
+    release.set()
+    await task
+    assert first.get_extra(DECISION)
+    assert plugin.client.decide.await_count == 1
+    assert (
+        json.loads(first.get_extra(DECISION)["state"])["target"]["text"]
+        == "睦头也来聊聊"
+    )
+
+
+@pytest.mark.asyncio
+async def test_queue_timeout_is_logged_without_releasing_owned_slot(
+    plugin, monkeypatch
+):
+    import importlib
+
+    module = importlib.import_module(type(plugin).__module__)
+    monkeypatch.setattr(module, "MAX_DECISION_AGE", 0.02)
+    await plugin.decision_slot.acquire()
+    e = event()
+    await plugin.collect(e)
+    await plugin.judge(e)
+    assert plugin.rooms.items[plugin.key(e)].last["status"] == "queue_timeout"
+    assert plugin.decision_slot.locked()
+    plugin.decision_slot.release()
+    plugin.client.decide.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unknown_quote_and_atall_preserve_available_context(plugin):
+    e = event(
+        parts=[
+            AtAll(),
+            Reply(id="q", message_str="某人建议机器人也来参与"),
+            Plain("你怎么看"),
+        ]
+    )
+    await plugin.collect(e)
+    await plugin.judge(e)
+    target = json.loads(plugin.client.decide.await_args.args[0]["state"])["target"]
+    assert target["mentions"] == ["all"]
+    assert target["reply_to"]["speaker"] == "unknown"
+    assert target["reply_to"]["text"] == "某人建议机器人也来参与"
