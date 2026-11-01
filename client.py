@@ -9,6 +9,7 @@ from email.utils import parsedate_to_datetime
 import aiohttp
 
 from .fastbrain_queue import priority_slot
+from .native_decision import NativeDecisionClient, NativeDecisionFailure
 
 
 class DecisionError(Exception):
@@ -49,14 +50,40 @@ def retry_delay(value: str | None) -> float:
 
 
 class SystemOneClient:
-    def __init__(self, endpoint: str, api_key: str, timeout: float, *, priority_enabled=False) -> None:
+    def __init__(
+        self,
+        endpoint: str,
+        api_key: str,
+        timeout: float,
+        *,
+        priority_enabled=False,
+        decision_provider_id="",
+        decision_service=None,
+        resolve_provider=None,
+    ) -> None:
         self.endpoint, self._api_key, self.timeout = endpoint, api_key, timeout
         self.priority_enabled = priority_enabled
+        self.decision_provider_id = decision_provider_id
+        self.native = NativeDecisionClient(decision_service, resolve_provider)
         self._session = None
         self.last_queue_ms = 0
         self.last_request_ms = 0
 
     async def decide(self, payload: dict) -> float:
+        if self.decision_provider_id:
+            try:
+                reply = await self.native.ask(
+                    self.decision_provider_id,
+                    payload,
+                    timeout=self.timeout,
+                    priority_enabled=self.priority_enabled,
+                )
+            except NativeDecisionFailure as exc:
+                raise DecisionError(exc.reason, exc.retry_after) from None
+            self.last_queue_ms, self.last_request_ms = reply.queue_ms, reply.request_ms
+            return probability(
+                {"model": reply.model, "answers": reply.answers}, payload["model"]
+            )
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self.timeout)

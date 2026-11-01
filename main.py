@@ -33,7 +33,10 @@ class FastBrainProactive(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
         self.cfg = Settings.read(config)
-        logger.info("FastBrain shared priority queue: enabled=%s", self.cfg.fastbrain_priority_enabled)
+        logger.info(
+            "FastBrain shared priority queue: enabled=%s",
+            self.cfg.fastbrain_priority_enabled,
+        )
         self.clock = time.monotonic
         self.rooms = Rooms(self.cfg, lambda: self.clock())
         self.client = SystemOneClient(
@@ -41,6 +44,15 @@ class FastBrainProactive(Star):
             str(config.get("api_key", "") or os.getenv("FASTBRAIN_API_KEY", "")),
             self.cfg.timeout,
             priority_enabled=self.cfg.fastbrain_priority_enabled,
+            decision_provider_id=self.cfg.decision_provider_id,
+            decision_service=getattr(context, "decision", None),
+            resolve_provider=getattr(context, "get_provider_by_id", None),
+        )
+        logger.info(
+            "FastBrain decision backend: %s",
+            "native:" + self.cfg.decision_provider_id
+            if self.cfg.decision_provider_id
+            else "legacy_http",
         )
         self.decision_slot = asyncio.Semaphore(1)
         self.blocked_until = 0.0
@@ -214,7 +226,9 @@ class FastBrainProactive(Star):
                 self.note_skip(event, room, "error_backoff")
                 return
             # Admission shares the existing message-age budget, not a new drop rule.
-            async with asyncio.timeout(MAX_DECISION_AGE - (started - captured["created"])):
+            async with asyncio.timeout(
+                MAX_DECISION_AGE - (started - captured["created"])
+            ):
                 p = await self.client.decide(payload)
             finished = self.clock()
             if not self.valid(event, room):
