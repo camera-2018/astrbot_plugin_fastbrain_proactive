@@ -31,6 +31,59 @@ from astrbot_plugin_fastbrain_proactive.main import (
 )
 
 
+@pytest.mark.asyncio
+async def test_core_caption_reaches_decision_history_dataset_and_reply(
+    plugin, tmp_path
+):
+    from astrbot.builtin_stars.astrbot.group_chat_context import GroupChatContext
+    from astrbot_plugin_fastbrain_proactive.dataset import Dataset
+    from astrbot_plugin_fastbrain_proactive.image_captions import CAPTIONS
+
+    group = GroupChatContext(None, plugin.context)
+    group.cfg = lambda e: {
+        "image_caption": True,
+        "image_caption_provider_id": "vision",
+        "image_caption_prompt": "describe",
+        "group_message_max_cnt": 10,
+    }
+    vision = AsyncMock(return_value="白板上写着：睦头，帮忙整理这份计划")
+    group.get_image_caption = vision
+    plugin.context.get_all_stars = lambda: [
+        SimpleNamespace(
+            name="astrbot", star_cls=SimpleNamespace(group_chat_context=group)
+        )
+    ]
+    plugin.dataset = Dataset(tmp_path, 1)
+    e = event("", parts=[Image(file="local-test")])
+    await plugin.connect_image_captions(e)
+    await group.handle_message(e)
+    assert e.get_extra(CAPTIONS)["captions"]
+    await plugin.collect(e)
+    await plugin.judge(e)
+    state = json.loads(plugin.client.decide.call_args.args[0]["state"])
+    assert "白板" in state["target"]["text"]
+    assert e.get_extra(DECISION) and e.is_at_or_wake_command
+    vision.assert_awaited_once()
+    req = ProviderRequest(prompt="image")
+    await plugin.prepare_reply(e, req)
+    assert "白板" in req.extra_user_content_parts[0].text
+    rows = [
+        json.loads(line)
+        for file in (tmp_path / "data").glob("*.jsonl")
+        for line in file.read_text().splitlines()
+    ]
+    inp = json.loads(rows[0]["input"])
+    assert inp["media_content_available"] is True
+    assert inp["target"][7] == 0 and "白板" in inp["target"][3]
+    next_event = event("嗯", mid="next")
+    await plugin.collect(next_event)
+    await plugin.judge(next_event)
+    state = json.loads(plugin.client.decide.call_args.args[0]["state"])
+    assert "白板" in state["history"][0]["text"]
+    await plugin.terminate()
+    assert group.get_image_caption is vision
+
+
 def event(text="官网写的是按年收费", mid="1", sender="user", group="g", parts=None):
     message = AstrBotMessage()
     message.type = MessageType.GROUP_MESSAGE

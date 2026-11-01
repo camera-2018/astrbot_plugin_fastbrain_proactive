@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "fastbrain-proactive-v0.1.8"
+VERSION = "fastbrain-proactive-v0.1.11"
 COLUMNS = [
     "id",
     "seconds_relative_to_target",
@@ -239,7 +239,7 @@ class Dataset:
                     [speaker(x) for x in item.get("mentions", [])],
                     edges,
                     meta.get("_media", []),
-                    meta.get("_images", 0),
+                    max(0, meta.get("_images", 0) - meta.get("_captioned_images", 0)),
                     bool(meta.get("_text_truncated", False)),
                     restored,
                     bool(reply),
@@ -255,11 +255,13 @@ class Dataset:
             "pinned_references": list(pinned.values()),
             "target": packed[-1],
             "image_policy": "ignore_untranscribed_images",
-            "media_content_available": False,
+            "media_content_available": any(
+                row[3].get("_captioned_images", 0) for row in source
+            ),
             "limitations": [
                 "Online visible context; earlier messages may have been pruned.",
                 "Times are receipt times; null reference times are unknown, not target time.",
-                "Media bodies unavailable; unknown other bots are not identified.",
+                "Image descriptions, when present, are model-generated text; media bodies unavailable; unknown other bots are not identified.",
                 "Missing reference metadata is not evidence of no reference.",
             ],
         }

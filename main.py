@@ -3,6 +3,7 @@
 import asyncio
 import os
 import time
+from sys import maxsize
 from collections import deque
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -19,6 +20,7 @@ from astrbot.core.star.session_llm_manager import SessionServiceManager
 from .dataset import Dataset
 from .client import DecisionError, SystemOneClient
 from .engine import Room, Rooms, Settings, build_payload, compact
+from .image_captions import CAPTIONS, ImageCaptionBridge, caption_text
 
 SEEN = "fastbrain_proactive_seen_v1"
 DECISION = "fastbrain_proactive_decision_v1"
@@ -57,6 +59,7 @@ class FastBrainProactive(Star):
         self.decision_slot = asyncio.Semaphore(1)
         self.blocked_until = 0.0
         self.closed = False
+        self.caption_bridge = ImageCaptionBridge(self.allowed)
         self.dataset = None
         self.dataset_error = ""
         if self.cfg.dataset_enabled:
@@ -89,6 +92,27 @@ class FastBrainProactive(Star):
             and self.scope(event) in self.cfg.groups
         )
 
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=maxsize)
+    async def connect_image_captions(self, event: AstrMessageEvent) -> None:
+        # Observe only: core still owns caption enablement, provider and requests.
+        if not self.allowed(event) or event.is_stopped():
+            return
+        get_stars = getattr(self.context, "get_all_stars", None)
+        if get_stars:
+            for star in get_stars():
+                core = getattr(star, "star_cls", None)
+                if getattr(star, "name", None) == "astrbot":
+                    previous = self.caption_bridge.target
+                    self.caption_bridge.attach(
+                        getattr(core, "group_chat_context", None)
+                    )
+                    if (
+                        self.caption_bridge.target is not None
+                        and self.caption_bridge.target is not previous
+                    ):
+                        logger.info("FastBrain core image-caption bridge connected")
+                    break
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=10000)
     async def collect(self, event: AstrMessageEvent) -> None:
         """Collect only events which passed core access/safety checks."""
@@ -97,6 +121,10 @@ class FastBrainProactive(Star):
         text = "".join(
             c.text for c in event.get_messages() if isinstance(c, Plain)
         ).strip()
+        capture = event.get_extra(CAPTIONS)
+        descriptions = caption_text(capture)
+        if descriptions:
+            text = "\n".join(x for x in (text, descriptions) if x)
         room = self.rooms.get(self.key(event))
         now = self.clock()
         mid = str(getattr(event.message_obj, "message_id", "") or "")
@@ -104,6 +132,20 @@ class FastBrainProactive(Star):
         routing = self.routing(event)
         has_routing = bool(routing.get("mentions") or routing.get("reply_to"))
         routing.update({"_id": mid, "_text_truncated": len(text) > self.cfg.max_bytes})
+        if descriptions:
+            routing["_captioned_images"] = len(capture["captions"])
+            routing["_text_truncated"] |= capture["truncated"]
+        if capture and routing["_images"]:
+            logger.info(
+                "FastBrain image context: scope=%s images=%s captions=%s failed=%s "
+                "truncated=%s caption_ms=%s",
+                self.scope(event),
+                routing["_images"],
+                len(capture["captions"]),
+                capture["failed"],
+                capture["truncated"],
+                capture["elapsed_ms"],
+            )
         if not room.add(sender, text or "[无正文文字]", mid, now, self.cfg, routing):
             return
         own = sender == str(event.get_self_id())
@@ -475,5 +517,6 @@ class FastBrainProactive(Star):
 
     async def terminate(self) -> None:
         self.closed = True
+        self.caption_bridge.close()
         self.rooms.items.clear()
         await self.client.close()
