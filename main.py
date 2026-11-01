@@ -33,12 +33,14 @@ class FastBrainProactive(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
         self.cfg = Settings.read(config)
+        logger.info("FastBrain shared priority queue: enabled=%s", self.cfg.fastbrain_priority_enabled)
         self.clock = time.monotonic
         self.rooms = Rooms(self.cfg, lambda: self.clock())
         self.client = SystemOneClient(
             self.cfg.endpoint,
             str(config.get("api_key", "") or os.getenv("FASTBRAIN_API_KEY", "")),
             self.cfg.timeout,
+            priority_enabled=self.cfg.fastbrain_priority_enabled,
         )
         self.decision_slot = asyncio.Semaphore(1)
         self.blocked_until = 0.0
@@ -211,7 +213,9 @@ class FastBrainProactive(Star):
             if started < self.blocked_until:
                 self.note_skip(event, room, "error_backoff")
                 return
-            p = await self.client.decide(payload)
+            # Admission shares the existing message-age budget, not a new drop rule.
+            async with asyncio.timeout(MAX_DECISION_AGE - (started - captured["created"])):
+                p = await self.client.decide(payload)
             finished = self.clock()
             if not self.valid(event, room):
                 action = "cancelled_or_handled"
@@ -252,15 +256,18 @@ class FastBrainProactive(Star):
                 "elapsed_ms": round((now - started) * 1000),
                 "queue_ms": round((started - queued) * 1000),
                 "mode": self.cfg.mode,
+                "scheduler_queue_ms": getattr(self.client, "last_queue_ms", 0),
+                "request_ms": getattr(self.client, "last_request_ms", 0),
             }
             logger.info(
                 "FastBrain proactive decision: scope=%s message_id=%s p_true=%.6f "
-                "inference_ms=%s queue_ms=%s action=%s",
+                "inference_ms=%s queue_ms=%s scheduler_queue_ms=%s action=%s",
                 self.scope(event),
                 str(event.message_obj.message_id)[:128],
                 p,
                 room.last["elapsed_ms"],
                 room.last["queue_ms"],
+                room.last["scheduler_queue_ms"],
                 action,
             )
         except asyncio.TimeoutError:

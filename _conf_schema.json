@@ -91,5 +91,11 @@
     "description": "False 样本保存概率（0–1）；True 始终全量保存",
     "type": "float",
     "default": 0.1
+  },
+  "fastbrain_priority_enabled": {
+    "description": "共享 FastBrain 优先队列（与另一插件同时开启）",
+    "type": "bool",
+    "default": false,
+    "hint": "相同 AstrBot 进程、接口和模型共用单请求队列；召回前置判断优先，连续3条后放行普通请求。不同进程或其他客户端不受此队列管理。"
   }
 }

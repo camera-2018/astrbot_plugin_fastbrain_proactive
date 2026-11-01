@@ -8,6 +8,8 @@ from email.utils import parsedate_to_datetime
 
 import aiohttp
 
+from .fastbrain_queue import priority_slot
+
 
 class DecisionError(Exception):
     def __init__(self, reason: str, retry_after: float = 60) -> None:
@@ -47,9 +49,12 @@ def retry_delay(value: str | None) -> float:
 
 
 class SystemOneClient:
-    def __init__(self, endpoint: str, api_key: str, timeout: float) -> None:
+    def __init__(self, endpoint: str, api_key: str, timeout: float, *, priority_enabled=False) -> None:
         self.endpoint, self._api_key, self.timeout = endpoint, api_key, timeout
+        self.priority_enabled = priority_enabled
         self._session = None
+        self.last_queue_ms = 0
+        self.last_request_ms = 0
 
     async def decide(self, payload: dict) -> float:
         if self._session is None or self._session.closed:
@@ -58,24 +63,31 @@ class SystemOneClient:
             )
         headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
         try:
-            async with self._session.post(
-                self.endpoint, json=payload, headers=headers, allow_redirects=False
-            ) as response:
-                if response.status != 200:
-                    raise DecisionError(
-                        f"http_{response.status}",
-                        retry_delay(response.headers.get("Retry-After")),
-                    )
-                body = bytearray()
-                async for chunk in response.content.iter_chunked(8192):
-                    body.extend(chunk)
-                    if len(body) > 65536:
-                        raise DecisionError("response_too_large")
-                try:
-                    data = json.loads(body)
-                except (ValueError, UnicodeDecodeError):
-                    raise DecisionError("invalid_json") from None
-                return probability(data, str(payload["model"]))
+            async with priority_slot(
+                self.endpoint, str(payload["model"]), enabled=self.priority_enabled
+            ) as ticket:
+                self.last_queue_ms = ticket.wait_ms
+                started = time.monotonic()
+                async with self._session.post(
+                    self.endpoint, json=payload, headers=headers, allow_redirects=False
+                ) as response:
+                    if response.status != 200:
+                        raise DecisionError(
+                            f"http_{response.status}",
+                            retry_delay(response.headers.get("Retry-After")),
+                        )
+                    body = bytearray()
+                    async for chunk in response.content.iter_chunked(8192):
+                        body.extend(chunk)
+                        if len(body) > 65536:
+                            raise DecisionError("response_too_large")
+                    try:
+                        data = json.loads(body)
+                    except (ValueError, UnicodeDecodeError):
+                        raise DecisionError("invalid_json") from None
+                    result = probability(data, str(payload["model"]))
+                    self.last_request_ms = round((time.monotonic() - started) * 1000)
+                    return result
         except asyncio.TimeoutError:
             raise DecisionError("timeout") from None
         except aiohttp.ClientError:

@@ -333,7 +333,8 @@ def test_reject_invalid_probabilities(p, q):
     "scenario",
     ["ok", "unauthorized", "redirect", "large", "bad_json", "wrong_model", "timeout"],
 )
-async def test_real_http_client(scenario, unused_tcp_port):
+@pytest.mark.parametrize("priority_enabled", [False, True])
+async def test_real_http_client(scenario, unused_tcp_port, priority_enabled):
     received = []
 
     async def serve(request):
@@ -368,6 +369,7 @@ async def test_real_http_client(scenario, unused_tcp_port):
         f"http://127.0.0.1:{unused_tcp_port}/systemone",
         "dummy-test-key",
         0.01 if scenario == "timeout" else 2,
+        priority_enabled=priority_enabled,
     )
     try:
         if scenario == "ok":

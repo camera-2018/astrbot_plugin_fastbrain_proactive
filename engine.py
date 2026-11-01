@@ -76,6 +76,7 @@ class Settings:
     names: tuple[str, ...]
     dataset_enabled: bool
     false_sample_rate: float
+    fastbrain_priority_enabled: bool
 
     @classmethod
     def read(cls, cfg: Mapping[str, Any]) -> "Settings":
@@ -105,6 +106,7 @@ class Settings:
             )
         return cls(
             mode=mode,
+            fastbrain_priority_enabled=bool(cfg.get("fastbrain_priority_enabled", False)),
             groups=frozenset(str(x) for x in cfg.get("allowed_groups", [])),
             endpoint=endpoint,
             model=str(cfg.get("model", "FastBrain-9B")),
