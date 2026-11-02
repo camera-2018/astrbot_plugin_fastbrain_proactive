@@ -1056,3 +1056,109 @@ async def test_dataset_outcome_once_and_private_context(plugin, tmp_path):
         for line in f.read_text().splitlines()
     ]
     assert [x["phase"] for x in lines] == ["generation_started", "send_hook_observed"]
+
+
+@pytest.mark.asyncio
+async def test_stable_account_room_preserves_pending_across_qq_self_ids(plugin):
+    first = event("睦头来聊聊", mid="first")
+    first.message_obj.self_id = "qq_official"
+    await plugin.collect(first)
+    await plugin.judge(first)
+    room = plugin.rooms.get(plugin.key(first))
+    assert room.pending_until > plugin.clock()
+    second = event("睦头你觉得呢", mid="second")
+    second.message_obj.self_id = "actual-bot-openid"
+    assert plugin.key(first) == plugin.key(second)
+    await plugin.collect(second)
+    await plugin.judge(second)
+    assert not second.get_extra(DECISION)
+    assert room.self_ids == {"qq_official", "actual-bot-openid"}
+    other = event("其他账号", mid="third")
+    other.get_platform_id = lambda: "another-account"
+    assert plugin.key(other) != plugin.key(first)
+
+
+@pytest.mark.asyncio
+async def test_passive_cooldown_shared_across_qq_self_ids(plugin):
+    first = event("已被动唤醒", mid="first")
+    first.message_obj.self_id = "actual-bot-openid"
+    first.is_at_or_wake_command = True
+    await plugin.collect(first)
+    second = event("木头帮我看看", mid="second")
+    second.message_obj.self_id = "qq_official"
+    await plugin.collect(second)
+    await plugin.judge(second)
+    plugin.client.decide.assert_awaited_once()
+    assert not second.get_extra(DECISION)
+    assert plugin.rooms.get(plugin.key(second)).last["status"] == "reply_cooldown"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"mentions": [{"id": "peer-openid"}]},
+        {"d": {"mentions": [{"member_openid": "peer-openid"}]}},
+        SimpleNamespace(raw_data={"mentions": [{"user_openid": "peer-openid"}]}),
+    ],
+)
+def test_raw_mention_envelopes_without_at_component(raw):
+    e = event("你怎么看")
+    e.message_obj.raw_message = raw
+    assert FastBrainProactive.routing(e)["mentions"] == ["peer-openid"]
+
+
+def test_raw_inline_mentions_are_anonymized_consistently():
+    from astrbot_plugin_fastbrain_proactive.engine import Room
+
+    cfg = Settings.read({})
+    room = Room()
+    room.remember_self("bot-real", "qq_official")
+    room.add("qq_official", "上句话", "a", 1, cfg)
+    room.add("alice", "<@peer-openid> 你觉得呢 <@bot-real>", "b", 2, cfg)
+    _, state = build_payload(cfg, room, "bot-real")
+    d = json.loads(state)
+    assert d["history"][0]["speaker"] == "bot"
+    assert d["target"]["mentions"] == ["user2", "bot"]
+    assert d["target"]["text"] == "<@user2> 你觉得呢 <@bot>"
+    assert "peer-openid" not in state and "bot-real" not in state
+
+
+@pytest.mark.parametrize(
+    "elements,expected",
+    [
+        ([{"id": "ref", "author": {"member_openid": "peer"}}], "peer"),
+        ([{"id": "other", "author": {"member_openid": "wrong"}}], ""),
+        ([{"author": {"member_openid": "wrong"}}], ""),
+        ([{"id": "ref", "author": "invalid"}], ""),
+        ([{"id": "ref", "sender_id": "a"}, {"id": "ref", "sender_id": "b"}], ""),
+    ],
+)
+def test_raw_reply_requires_matching_id_and_unambiguous_author(elements, expected):
+    raw = {"d": {"msg_elements": elements}}
+    assert FastBrainProactive._extract_raw_reply_speaker(raw, "ref") == expected
+    assert FastBrainProactive._extract_raw_reply_speaker(raw, "") == ""
+
+
+def test_reply_history_resolution_never_uses_future_or_truncated_text():
+    from astrbot_plugin_fastbrain_proactive.engine import Room
+
+    cfg = Settings.read({})
+    room = Room()
+    room.add("a", "过去的完整原话", "old", 1, cfg, {"_id": "old"})
+    assert room.resolve_reply_speaker({"_message_id": "old", "text": "x"}) == "a"
+    assert room.resolve_reply_speaker({"text": "过去的完整原话"}) == "a"
+    room.add("b", "过去的完整原话", "other", 2, cfg)
+    assert room.resolve_reply_speaker({"text": "过去的完整原话"}) == ""
+    room.add("c", "截短句", "cut", 3, cfg, {"_text_truncated": True})
+    assert room.resolve_reply_speaker({"text": "截短句"}) == ""
+    room.add(
+        "d",
+        "目标",
+        "target",
+        4,
+        cfg,
+        {"reply_to": {"text": "以后才说", "speaker": "", "_message_id": "future"}},
+    )
+    room.add("e", "以后才说", "future", 5, cfg, {"_id": "future"})
+    _, state = build_payload(cfg, room, "bot")
+    assert json.loads(state)["history"][-1]["reply_to"]["speaker"] == "unknown"

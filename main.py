@@ -19,7 +19,7 @@ from astrbot.core.star.session_llm_manager import SessionServiceManager
 
 from .dataset import Dataset
 from .client import DecisionError, SystemOneClient
-from .engine import Room, Rooms, Settings, build_payload, compact
+from .engine import RAW_MENTION_RE, Room, Rooms, Settings, build_payload, compact
 from .image_captions import CAPTIONS, ImageCaptionBridge, caption_text
 
 SEEN = "fastbrain_proactive_seen_v1"
@@ -78,9 +78,12 @@ class FastBrainProactive(Star):
 
     @staticmethod
     def key(event: AstrMessageEvent) -> tuple[str, str, str]:
+        platform_id = str(event.get_platform_id() or "")
+        self_id = str(event.get_self_id() or "")
+        account = platform_id or self_id
         return (
-            str(event.get_platform_id()),
-            str(event.get_self_id()),
+            account,
+            account,
             str(event.get_group_id()),
         )
 
@@ -126,10 +129,16 @@ class FastBrainProactive(Star):
         if descriptions:
             text = "\n".join(x for x in (text, descriptions) if x)
         room = self.rooms.get(self.key(event))
+        self_id = str(event.get_self_id())
+        room.remember_self(self_id)
         now = self.clock()
         mid = str(getattr(event.message_obj, "message_id", "") or "")
         sender = str(event.get_sender_id())
         routing = self.routing(event)
+        if "reply_to" in routing and not routing["reply_to"].get("speaker"):
+            resolved = room.resolve_reply_speaker(routing["reply_to"])
+            if resolved:
+                routing["reply_to"]["speaker"] = resolved
         has_routing = bool(routing.get("mentions") or routing.get("reply_to"))
         routing.update({"_id": mid, "_text_truncated": len(text) > self.cfg.max_bytes})
         if descriptions:
@@ -148,7 +157,7 @@ class FastBrainProactive(Star):
             )
         if not room.add(sender, text or "[无正文文字]", mid, now, self.cfg, routing):
             return
-        own = sender == str(event.get_self_id())
+        own = room.is_self(sender, self_id)
         if event.is_at_or_wake_command or own:
             room.cooldown_until = max(room.cooldown_until, now + self.cfg.cooldown)
         # Only actual passive handling excludes an event, not @/reply syntax.
@@ -166,14 +175,62 @@ class FastBrainProactive(Star):
                 "created": now,
                 "received_at": time.time(),
                 "rows": tuple(room.messages) if eligible else (),
+                "self_ids": set(room.self_ids),
             },
         )
+
+    @staticmethod
+    def _raw_containers(raw_msg: Any) -> list[Any]:
+        """Read supported adapter envelopes without assuming their field types."""
+        containers = [raw_msg]
+        raw_data = (
+            raw_msg.get("raw_data")
+            if isinstance(raw_msg, dict)
+            else getattr(raw_msg, "raw_data", None)
+        )
+        if isinstance(raw_data, dict):
+            containers.append(raw_data)
+        for container in list(containers):
+            if isinstance(container, dict) and isinstance(container.get("d"), dict):
+                containers.append(container["d"])
+        return containers
+
+    @staticmethod
+    def _raw_field(item: Any, name: str) -> Any:
+        return item.get(name) if isinstance(item, dict) else getattr(item, name, None)
+
+    @staticmethod
+    def _extract_raw_reply_speaker(raw_msg: Any, reply_id: str) -> str:
+        # An unrelated or ID-less element must never claim the quoted speaker.
+        if not reply_id:
+            return ""
+        matches = set()
+        get = FastBrainProactive._raw_field
+        for container in FastBrainProactive._raw_containers(raw_msg):
+            elements = get(container, "msg_elements")
+            if not isinstance(elements, list):
+                continue
+            for elem in elements:
+                eid = str(get(elem, "id") or get(elem, "message_id") or "")
+                if eid != reply_id:
+                    continue
+                author = get(elem, "author")
+                sender = (
+                    get(author, "member_openid")
+                    or get(author, "user_openid")
+                    or get(author, "id")
+                    or get(elem, "sender_id")
+                )
+                if isinstance(sender, (str, int)) and str(sender):
+                    matches.add(str(sender)[:128])
+        return next(iter(matches)) if len(matches) == 1 else ""
 
     @staticmethod
     def routing(event: AstrMessageEvent) -> dict:
         """Use adapter-provided quote text only; never fetch media or remote history."""
         result = {"_images": 0, "_media": []}
         mentions = []
+        raw_msg = getattr(getattr(event, "message_obj", None), "raw_message", None)
         for part in event.get_messages():
             if isinstance(part, Image):
                 result["_images"] += 1
@@ -191,19 +248,40 @@ class FastBrainProactive(Star):
                 mentions.append("all")
             elif isinstance(part, At):
                 mentions.append(str(part.qq)[:128])
+            elif isinstance(part, Plain):
+                for inline_id in RAW_MENTION_RE.findall(part.text or ""):
+                    mentions.append(str(inline_id)[:128])
             elif isinstance(part, Reply) and "reply_to" not in result:
                 quote = "".join(
                     c.text for c in (part.chain or []) if isinstance(c, Plain)
                 )
                 quote = quote or part.message_str or part.text or ""
+                reply_id = str(part.id)
                 sender = str(part.sender_id or "")[:128]
+                if not sender:
+                    sender = FastBrainProactive._extract_raw_reply_speaker(
+                        raw_msg, reply_id
+                    )
                 result["reply_to"] = {
                     "speaker": sender,
                     "text": quote[:1024],
                     "truncated": len(quote) > 1024,
-                    "_message_id": str(part.id),
+                    "_message_id": reply_id,
                     "_time": part.time,
                 }
+        for container in FastBrainProactive._raw_containers(raw_msg):
+            raw_mentions = FastBrainProactive._raw_field(container, "mentions")
+            if not isinstance(raw_mentions, list):
+                continue
+            for item in raw_mentions:
+                get = FastBrainProactive._raw_field
+                mid = (
+                    get(item, "id")
+                    or get(item, "member_openid")
+                    or get(item, "user_openid")
+                )
+                if isinstance(mid, (str, int)) and str(mid):
+                    mentions.append(str(mid)[:128])
         if mentions:
             result["mentions"] = list(dict.fromkeys(mentions))[:16]
         return result
@@ -239,7 +317,10 @@ class FastBrainProactive(Star):
             return
         try:
             # Freeze the target and its preceding context before waiting for a slot.
-            snapshot = Room(messages=deque(captured["rows"]))
+            snapshot = Room(
+                messages=deque(captured["rows"]),
+                self_ids=set(captured.get("self_ids", ())),
+            )
             payload, state = build_payload(self.cfg, snapshot, str(event.get_self_id()))
         except ValueError:
             self.note_skip(event, room, "input_budget")
@@ -345,7 +426,7 @@ class FastBrainProactive(Star):
                     rid = await asyncio.to_thread(
                         self.dataset.record,
                         scope=self.scope(event),
-                        self_id=str(event.get_self_id()),
+                        self_id=self.key(event)[1],
                         message_id=str(event.message_obj.message_id or ""),
                         received_at=captured["received_at"],
                         rows=captured["rows"],
@@ -476,7 +557,9 @@ class FastBrainProactive(Star):
             )
         if text:
             now = self.clock()
-            room.add(str(event.get_self_id()), text, "", now, self.cfg)
+            self_id = str(event.get_self_id())
+            room.remember_self(self_id)
+            room.add(self_id, text, "", now, self.cfg)
             room.cooldown_until = max(room.cooldown_until, now + self.cfg.cooldown)
             event.set_extra(SENT, True)
 

@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "fastbrain-proactive-v0.1.11"
+VERSION = "fastbrain-proactive-v0.1.12"
 COLUMNS = [
     "id",
     "seconds_relative_to_target",

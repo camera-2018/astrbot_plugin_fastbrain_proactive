@@ -2,11 +2,14 @@
 
 import json
 import math
+import re
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping
 from typing import Any
 from dataclasses import dataclass, field
+
+RAW_MENTION_RE = re.compile(r"<@!?([^\s<>]{1,128})>")
 
 POLICY = (
     "背景：机器人是有名字和人格的群聊参与者，无需等待@或正式任务。True表示值得回应一句，"
@@ -19,7 +22,7 @@ POLICY = (
     "直接询问机器人的兴趣、经历、能力、偏好或态度时True；‘我们家某某’等第三人称也可以在当面问它。"
     "围绕机器人发问、调侃、期待表态、试探是否在场或测试能否主动说话时倾向True，"
     "无名字但让它试着主动回应也选True，不因提到模型或插件就当成技术讨论。"
-    "自然接续与机器人的互动，或话题有明确、有价值的补充机会也True。"
+    "自然接续与本机器人的互动选True；面向群友的定向交流、普通技术讨论、被当作比喻或比较项并非邀请，有知识可补充不等于邀请。"
     "仅记录配置、转述旧话、谈论同名他人、明确请另一个人回答时，不因名字出现就True。"
     "没有邀请机器人时，向你们/大家征询亲身使用体验、自言自语考虑方案、无需回应的碎片闲聊、"
     "礼貌收尾、没有可读文字应False。不能仅因问号或小模型就插话。拿不准且没有参与理由时False。"
@@ -51,7 +54,7 @@ FEWSHOT = (
 )
 
 DEFAULT_PERSONA = (
-    "我是睦头，简短自然地参与群聊。有人邀请我、接我的话，或话题确有值得补充的内容时主动接话；"
+    "我是睦头，简短自然地参与群聊。有人邀请我或接我的话时主动接话；"
     "不必等别人@，也不要求我先前说过话。不抢群友之间的定向交流，不无意义刷屏。"
 )
 
@@ -148,6 +151,21 @@ class Room:
     last: dict = field(default_factory=dict)
     pending_until: float = 0
     pending_owner: int = 0
+    self_ids: set[str] = field(default_factory=set)
+
+    def remember_self(self, *ids: str) -> None:
+        for item in ids:
+            if item:
+                self.self_ids.add(str(item)[:128])
+
+    def is_self(self, sender: str, current_self_id: str = "") -> bool:
+        if not sender:
+            return False
+        return sender == current_self_id or sender in self.self_ids
+
+    def resolve_reply_speaker(self, reply: Mapping[str, Any]) -> str:
+        rows = list(self.messages)
+        return _resolve_row_reply_speaker(rows, len(rows), reply)
 
     def add(
         self,
@@ -196,6 +214,32 @@ class Rooms:
         return room
 
 
+def _resolve_row_reply_speaker(
+    rows: list[tuple[Any, ...]], idx: int, reply: Mapping[str, Any]
+) -> str:
+    speaker = str(reply.get("speaker") or "")[:128]
+    if speaker and speaker != "unknown":
+        return speaker
+    ref_id = str(reply.get("_message_id") or "")
+    if ref_id:
+        for _, row_sender, _, row_routing in reversed(rows[:idx]):
+            if row_routing.get("_id") == ref_id and row_sender:
+                return str(row_sender)[:128]
+    if not reply.get("truncated", False):
+        quote_norm = str(reply.get("text") or "").strip()
+        if quote_norm:
+            matched = {
+                str(row_sender)[:128]
+                for _, row_sender, row_text, routing in rows[:idx]
+                if row_sender
+                and not routing.get("_text_truncated", False)
+                and str(row_text or "").strip() == quote_norm
+            }
+            if len(matched) == 1:
+                return next(iter(matched))
+    return ""
+
+
 def build_payload(cfg: Settings, room: Room, self_id: str) -> tuple[dict, str]:
     """Prune old turns, never truncate the target or persona to force a decision.
 
@@ -210,21 +254,38 @@ def build_payload(cfg: Settings, room: Room, self_id: str) -> tuple[dict, str]:
         def identity(sender):
             if not sender:
                 return "unknown"
-            if sender == self_id:
+            if sender == self_id or sender in room.self_ids:
                 return "bot"
             return speakers.setdefault(sender, f"user{len(speakers) + 1}")
 
-        for _, sender, text, routing in rows:
-            item = {"speaker": identity(sender), "text": text}
-            if routing.get("mentions"):
+        for idx, (_, sender, text, routing) in enumerate(rows):
+            raw_mentions = list(routing.get("mentions") or [])
+            for inline_id in RAW_MENTION_RE.findall(text or ""):
+                if inline_id not in raw_mentions:
+                    raw_mentions.append(inline_id[:128])
+            raw_mentions = raw_mentions[:16]
+            speaker_id = identity(sender)
+            normalized_text = (
+                RAW_MENTION_RE.sub(
+                    lambda m: (
+                        f"<@{'all' if m.group(1) == 'all' else identity(m.group(1)[:128])}>"
+                    ),
+                    text,
+                )
+                if raw_mentions and "<@" in (text or "")
+                else text
+            )
+            item = {"speaker": speaker_id, "text": normalized_text}
+            if raw_mentions:
                 item["mentions"] = [
                     "all" if target == "all" else identity(target)
-                    for target in routing["mentions"]
+                    for target in raw_mentions
                 ]
             if "reply_to" in routing:
                 reply = routing["reply_to"]
+                resolved_speaker = _resolve_row_reply_speaker(rows, idx, reply)
                 item["reply_to"] = {
-                    "speaker": identity(reply["speaker"]),
+                    "speaker": identity(resolved_speaker),
                     "text": reply["text"],
                     "truncated": reply.get("truncated", False),
                 }
