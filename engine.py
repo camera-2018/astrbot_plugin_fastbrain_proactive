@@ -12,8 +12,7 @@ from dataclasses import dataclass, field
 RAW_MENTION_RE = re.compile(r"<@!?([^\s<>]{1,128})>")
 
 POLICY = (
-    "背景：机器人是有名字和人格的群聊参与者，无需等待@或正式任务。True表示值得回应一句，"
-    "回应邀请、表达看法也有价值。判断此刻是否值得回应，输出True或False。"
+    "背景：你是有名字的群聊参与者。判断是否被邀请参与或自然接续互动，输出True或False。"
     "消息尚未被核心的@或唤醒规则接管。结合bot_names、persona、history和target识别说话对象。"
     "先看谁被请来办事：请群友处理机器人相关事务不是交办给机器人，应False。"
     "提到机器人的名字或别称，是参与信号，应提高回应倾向。当前正文提名机器人并请它办事，"
@@ -54,8 +53,9 @@ FEWSHOT = (
 )
 
 DEFAULT_PERSONA = (
-    "我是睦头，简短自然地参与群聊。有人邀请我或接我的话时主动接话；"
-    "不必等别人@，也不要求我先前说过话。不抢群友之间的定向交流，不无意义刷屏。"
+    "我是睦头，简短自然地参与群聊。有人叫我、回应我的话、自然延续刚和我的对话，"
+    "或明确试探/邀请机器人发言时主动接话。不抢群友之间的定向交流，"
+    "不在无人邀请的普通闲聊或技术讨论中强行插话。"
 )
 
 
@@ -70,6 +70,8 @@ class Settings:
     endpoint: str
     model: str
     threshold: float
+    cold_start_threshold: float
+    directed_other_threshold: float
     timeout: float
     cooldown: float
     ttl: float
@@ -110,6 +112,13 @@ class Settings:
             raise ValueError(
                 "Endpoint must be an HTTP(S) URL without credentials/query/fragment"
             )
+        threshold = number("threshold", 0.5, 0, 1)
+        cold_start_threshold = max(
+            threshold, number("cold_start_threshold", 0.85, 0, 1)
+        )
+        directed_other_threshold = max(
+            cold_start_threshold, number("directed_other_threshold", 0.95, 0, 1)
+        )
         return cls(
             mode=mode,
             decision_provider_id=str(cfg.get("decision_provider_id", "")).strip(),
@@ -119,7 +128,9 @@ class Settings:
             groups=frozenset(str(x) for x in cfg.get("allowed_groups", [])),
             endpoint=endpoint,
             model=str(cfg.get("model", "FastBrain-9B")),
-            threshold=number("threshold", 0.5, 0, 1),
+            threshold=threshold,
+            cold_start_threshold=cold_start_threshold,
+            directed_other_threshold=directed_other_threshold,
             timeout=number("timeout_seconds", 15, 1, 60),
             cooldown=number("cooldown_seconds", 30, 1, 86400),
             ttl=number("context_ttl_seconds", 1800, 10, 86400),
@@ -151,6 +162,8 @@ class Room:
     last: dict = field(default_factory=dict)
     pending_until: float = 0
     pending_owner: int = 0
+    pending_tier: str = ""
+    pending_event: Any = None
     self_ids: set[str] = field(default_factory=set)
 
     def remember_self(self, *ids: str) -> None:
@@ -193,6 +206,39 @@ class Room:
         while len(self.messages) > cfg.max_messages:
             self.messages.popleft()
         return True
+
+
+@dataclass(frozen=True)
+class Gate:
+    tier: str
+    threshold: float
+    direct: bool
+
+
+def choose_gate(cfg: Settings, state: Mapping[str, Any]) -> Gate:
+    """Choose a gate using only the target and the history sent to FastBrain."""
+    target = state.get("target") or {}
+    text = str(target.get("text") or "")
+    mentions = target.get("mentions") or []
+    quoted = (target.get("reply_to") or {}).get("speaker") or ""
+    named = any(name and name in text for name in cfg.names)
+    # An unhandled @bot is still a direct interaction; core-handled @s never
+    # reach this classifier. A named request can also quote another user.
+    direct = bool(named or quoted == "bot" or "bot" in mentions)
+    if direct:
+        return Gate("interaction", cfg.threshold, True)
+    directed_to_other = any(target_id != "bot" for target_id in mentions) or str(
+        quoted
+    ).startswith("user")
+    if directed_to_other:
+        return Gate("directed_other", cfg.directed_other_threshold, False)
+    # An unknown quote cannot prove the exchange is with the bot.
+    if quoted != "unknown" and any(
+        item.get("speaker") == "bot" for item in (state.get("history") or [])[-2:]
+    ):
+        return Gate("interaction", cfg.threshold, False)
+    # Includes the undefined boundary where bot spoke third-most-recently.
+    return Gate("cold_start", cfg.cold_start_threshold, False)
 
 
 class Rooms:

@@ -30,14 +30,24 @@
     "default": "FastBrain-9B"
   },
   "threshold": {
-    "description": "True 概率阈值。0.5 保守；之前 0.11 仅为实验值，不是质量保证",
+    "description": "直接互动与近期互动的 True 概率阈值，也是保存模型银标时的基准阈值",
     "type": "float",
     "default": 0.5
+  },
+  "cold_start_threshold": {
+    "description": "无直接互动、无最近两条机器人发言时的主动插话阈值",
+    "type": "float",
+    "default": 0.85
+  },
+  "directed_other_threshold": {
+    "description": "明确 @ 或引用其他群友、没有叫机器人时的阈值",
+    "type": "float",
+    "default": 0.95
   },
   "decision_persona": {
     "description": "判断用精简人格；实际回复继续使用会话人格。请随会话人格同步调整",
     "type": "text",
-    "default": "我是睦头，简短自然地参与群聊。有人邀请我、接我的话，或话题确有值得补充的内容时主动接话；不必等别人@，也不要求我先前说过话。不抢群友之间的定向交流，不无意义刷屏。"
+    "default": "我是睦头，简短自然地参与群聊。有人叫我、回应我的话、自然延续刚和我的对话，或明确试探/邀请机器人发言时主动接话。不抢群友之间的定向交流，不在无人邀请的普通闲聊或技术讨论中强行插话。"
   },
   "fewshot": {
     "description": "附加十八个简短正反例（邀请、提名交办、引用中交办、普通提及及定向交流）",

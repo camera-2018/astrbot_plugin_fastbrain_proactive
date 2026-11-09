@@ -22,6 +22,7 @@ from astrbot_plugin_fastbrain_proactive.engine import (
     Rooms,
     Settings,
     build_payload,
+    choose_gate,
     compact,
 )
 from astrbot_plugin_fastbrain_proactive.main import (
@@ -552,6 +553,8 @@ async def test_sdk_waking_access_and_process_pipeline(
                 Plain("同意"),
             ]
         )
+    if case in {"human_at_positive", "human_quote_positive"}:
+        plugin.client.decide.return_value = 0.96
     if case == "negative":
         plugin.client.decide.return_value = 0.01
     if case == "passive":
@@ -781,6 +784,7 @@ def test_fewshot_budget_preserves_target_with_bounded_history():
 
 @pytest.mark.asyncio
 async def test_quote_and_mentions_keep_sender_relationships(plugin):
+    plugin.client.decide.return_value = 0.96
     quoted = event(
         "邀请",
         parts=[
@@ -974,7 +978,7 @@ async def test_dataset_captures_model_not_actual_speech(
 
     plugin.dataset = Dataset(tmp_path, 1)
     plugin.client.decide.return_value = probability
-    e = event("木头查下明天的安排")
+    e = event("看看明天的安排")
     await plugin.collect(e)
     plugin.rooms.get(plugin.key(e)).cooldown_until = 1100
     await plugin.judge(e)
@@ -1084,7 +1088,7 @@ async def test_passive_cooldown_shared_across_qq_self_ids(plugin):
     first.message_obj.self_id = "actual-bot-openid"
     first.is_at_or_wake_command = True
     await plugin.collect(first)
-    second = event("木头帮我看看", mid="second")
+    second = event("帮我看看", mid="second")
     second.message_obj.self_id = "qq_official"
     await plugin.collect(second)
     await plugin.judge(second)
@@ -1162,3 +1166,469 @@ def test_reply_history_resolution_never_uses_future_or_truncated_text():
     room.add("e", "以后才说", "future", 5, cfg, {"_id": "future"})
     _, state = build_payload(cfg, room, "bot")
     assert json.loads(state)["history"][-1]["reply_to"]["speaker"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    "target,history,tier,threshold,direct",
+    [
+        ({"text": "睦头觉得呢", "mentions": ["user2"]}, [], "interaction", 0.5, True),
+        (
+            {"text": "你觉得呢", "reply_to": {"speaker": "bot"}},
+            [],
+            "interaction",
+            0.5,
+            True,
+        ),
+        ({"text": "你觉得呢", "mentions": ["bot"]}, [], "interaction", 0.5, True),
+        (
+            {"text": "怎么样"},
+            [{"speaker": "bot"}, {"speaker": "user1"}],
+            "interaction",
+            0.5,
+            False,
+        ),
+        (
+            {"text": "怎么样", "mentions": ["user2"]},
+            [{"speaker": "bot"}],
+            "directed_other",
+            0.95,
+            False,
+        ),
+        (
+            {"text": "怎么样", "reply_to": {"speaker": "user2"}},
+            [{"speaker": "bot"}],
+            "directed_other",
+            0.95,
+            False,
+        ),
+        (
+            {"text": "怎么样", "reply_to": {"speaker": "unknown"}},
+            [{"speaker": "bot"}],
+            "cold_start",
+            0.85,
+            False,
+        ),
+        (
+            {"text": "怎么样"},
+            [{"speaker": "bot"}, {"speaker": "user1"}, {"speaker": "user2"}],
+            "cold_start",
+            0.85,
+            False,
+        ),
+        ({"text": "普通群聊"}, [], "cold_start", 0.85, False),
+    ],
+)
+def test_gate_uses_visible_relationships(target, history, tier, threshold, direct):
+    gate = choose_gate(Settings.read({}), {"target": target, "history": history})
+    assert (gate.tier, gate.threshold, gate.direct) == (tier, threshold, direct)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "parts,probability,should_wake",
+    [
+        ([Plain("大家觉得呢")], 0.849, False),
+        ([Plain("大家觉得呢")], 0.85, True),
+        ([At(qq="other"), Plain("你觉得呢")], 0.949, False),
+        ([At(qq="other"), Plain("你觉得呢")], 0.95, True),
+        ([At(qq="other"), Plain("睦头你觉得呢")], 0.5, True),
+    ],
+)
+async def test_tier_threshold_boundaries(plugin, parts, probability, should_wake):
+    plugin.client.decide.return_value = probability
+    e = event(parts=parts)
+    await plugin.collect(e)
+    await plugin.judge(e)
+    assert bool(e.get_extra(DECISION)) == should_wake
+
+
+@pytest.mark.asyncio
+async def test_tier_block_keeps_raw_positive_in_silver_dataset(plugin, tmp_path):
+    from astrbot_plugin_fastbrain_proactive.dataset import Dataset
+
+    plugin.dataset = Dataset(tmp_path, 0)
+    plugin.client.decide.return_value = 0.7
+    e = event("群友随口聊天")
+    await plugin.collect(e)
+    await plugin.judge(e)
+    assert not e.get_extra(DECISION)
+    with plugin.dataset.connect() as c:
+        training, audit = c.execute("SELECT training, audit FROM samples").fetchone()
+    training, audit = json.loads(training), json.loads(audit)
+    assert training["label"] is True and audit["decision"] is True
+    assert audit["threshold"] == 0.5 and audit["gate_threshold"] == 0.85
+    assert audit["gate_tier"] == "cold_start" and audit["gate_decision"] is False
+    assert audit["action"] == "tier_threshold_block"
+
+
+@pytest.mark.asyncio
+async def test_direct_interaction_bypasses_cooldown_without_streaming(plugin):
+    plugin.client.decide.return_value = 0.55
+    e = event("睦头，你觉得呢")
+    await plugin.collect(e)
+    room = plugin.rooms.get(plugin.key(e))
+    room.cooldown_until = 1100
+    await plugin.judge(e)
+    assert e.get_extra(DECISION) and e.get_extra("enable_streaming") is False
+
+
+@pytest.mark.asyncio
+async def test_direct_interaction_supersedes_only_cold_proactive_pending(plugin):
+    old = event("大家在聊什么", mid="old")
+    await plugin.collect(old)
+    await plugin.judge(old)
+    await plugin.prepare_reply(old, ProviderRequest())
+    assert old.get_extra(DECISION)["tier"] == "cold_start"
+    direct = event("睦头，帮我看看", mid="direct")
+    await plugin.collect(direct)
+    await plugin.judge(direct)
+    assert direct.get_extra(DECISION) and old.is_stopped()
+    assert old.get_extra(DECISION)["superseded"] is True
+    old.set_result(old.plain_result("已经过时的旧回答"))
+    await plugin.guard_reply(old)
+    assert not old.get_result() or not old.get_result().chain
+    assert plugin.rooms.get(plugin.key(direct)).pending_owner == id(direct)
+    req = ProviderRequest()
+    await plugin.prepare_reply(direct, req)
+    assert not direct.is_stopped() and len(req.extra_user_content_parts) == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_does_not_supersede_passive_or_direct_pending(plugin):
+    passive = event("@睦头", mid="passive")
+    passive.is_at_or_wake_command = True
+    await plugin.collect(passive)
+    await plugin.prepare_reply(passive, ProviderRequest())
+    direct = event("睦头再帮我看看", mid="direct")
+    await plugin.collect(direct)
+    await plugin.judge(direct)
+    assert not direct.get_extra(DECISION) and not passive.is_stopped()
+    assert plugin.rooms.get(plugin.key(direct)).last["status"] == "reply_pending"
+
+
+@pytest.mark.asyncio
+async def test_direct_does_not_supersede_another_direct_interaction(plugin):
+    old = event("睦头先帮我看看", mid="old-direct")
+    await plugin.collect(old)
+    await plugin.judge(old)
+    direct = event("睦头再帮我看看", mid="new-direct")
+    await plugin.collect(direct)
+    await plugin.judge(direct)
+    assert old.get_extra(DECISION) and not old.is_stopped()
+    assert not direct.get_extra(DECISION)
+    assert plugin.rooms.get(plugin.key(direct)).pending_owner == id(old)
+
+
+async def _prepared_proactive(plugin, text="大家在讨论一件事"):
+    e = event(text, mid="trigger")
+    await plugin.collect(e)
+    await plugin.judge(e)
+    await plugin.prepare_reply(e, ProviderRequest())
+    return e
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message,blocked",
+    [
+        (
+            "LLM 响应错误: All chat models failed: EmptyModelOutputError: no choices",
+            True,
+        ),
+        (
+            "LLM 响应错误: All chat models failed: BadRequestError: Error code: 400",
+            True,
+        ),
+        ("All chat models failed: unavailable", True),
+        ("  ", True),
+        ("刚才有人问 LLM 响应错误是什么意思", False),
+        ("这是正常回复", False),
+    ],
+)
+async def test_pre_send_error_guard_only_filters_proactive_errors(
+    plugin, message, blocked
+):
+    e = await _prepared_proactive(plugin)
+    e.set_result(e.plain_result(message))
+    await plugin.guard_reply(e)
+    assert e.is_stopped() == blocked
+    if blocked:
+        assert not e.get_result() or not e.get_result().chain
+
+
+@pytest.mark.asyncio
+async def test_error_guard_does_not_touch_passive_reply(plugin):
+    e = event("@睦头")
+    e.set_result(e.plain_result("LLM 响应错误: 测试"))
+    await plugin.guard_reply(e)
+    assert not e.is_stopped() and e.get_result() is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text,elapsed,new_messages,stopped",
+    [
+        ("普通插话", 61, 20, True),
+        ("普通插话", 60, 20, False),
+        ("普通插话", 61, 19, False),
+        ("睦头，帮忙看看", 61, 20, False),
+    ],
+)
+async def test_send_freshness_and_direct_exemption(
+    plugin, text, elapsed, new_messages, stopped
+):
+    e = await _prepared_proactive(plugin, text)
+    send = AsyncMock()
+    e.send = send
+    for i in range(new_messages):
+        await plugin.collect(event("群友消息", mid=f"new-{i}"))
+    plugin.clock = lambda: 1000 + elapsed
+    e.set_result(e.plain_result("正常答案"))
+    await plugin.guard_reply(e)
+    assert e.is_stopped() == stopped
+    if not stopped and new_messages >= 3:
+        await e.send(e.get_result())
+        send.assert_awaited_once()
+        assert isinstance(e.get_result().chain[0], Reply)
+        assert e.get_result().chain[0].id == "trigger"
+
+
+@pytest.mark.asyncio
+async def test_busy_group_quote_is_single_and_targets_original_message(plugin):
+    e = await _prepared_proactive(plugin)
+    send = AsyncMock()
+    e.send = send
+    for i in range(3):
+        await plugin.collect(event("群友消息", mid=f"new-{i}"))
+    e.set_result(e.plain_result("正常答案"))
+    await plugin.guard_reply(e)
+    await plugin.guard_reply(e)
+    await e.send(e.get_result())
+    send.assert_awaited_once()
+    quotes = [part for part in e.get_result().chain if isinstance(part, Reply)]
+    assert len(quotes) == 1 and quotes[0].id == "trigger"
+
+
+@pytest.mark.asyncio
+async def test_new_messages_during_decoration_are_checked_again_at_send(plugin):
+    e = await _prepared_proactive(plugin)
+    send = AsyncMock()
+    e.send = send
+    plugin.clock = lambda: 1061
+    await plugin.remember_answer(
+        e, None, SimpleNamespace(role="assistant", completion_text="正常答案")
+    )
+    e.set_result(e.plain_result("正常答案"))
+    await plugin.guard_reply(e)
+    for i in range(20):
+        await plugin.collect(event("群友消息", mid=f"late-{i}"))
+    await e.send(e.get_result())
+    send.assert_not_awaited()
+    assert e.is_stopped() and plugin.rooms.get(plugin.key(e)).pending_until == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role,text", [("err", "upstream failed"), ("assistant", "")])
+async def test_agent_failure_or_empty_result_releases_pending(plugin, role, text):
+    e = await _prepared_proactive(plugin)
+    room = plugin.rooms.get(plugin.key(e))
+    await plugin.remember_answer(
+        e, None, SimpleNamespace(role=role, completion_text=text)
+    )
+    assert e.is_stopped() and room.pending_until == 0
+
+
+@pytest.mark.asyncio
+async def test_successful_proactive_pending_released_after_send(plugin):
+    e = await _prepared_proactive(plugin)
+    room = plugin.rooms.get(plugin.key(e))
+    await plugin.remember_answer(
+        e, None, SimpleNamespace(role="assistant", completion_text="正常答复")
+    )
+    assert room.pending_owner == id(e) and room.pending_until > plugin.clock()
+    e._has_send_oper = True
+    await plugin.after_sent(e)
+    assert room.pending_owner == 0 and room.pending_until == 0
+
+
+@pytest.mark.asyncio
+async def test_multimedia_only_agent_result_is_not_mistaken_for_empty(plugin):
+    e = await _prepared_proactive(plugin)
+    response = SimpleNamespace(
+        role="assistant",
+        completion_text="",
+        result_chain=SimpleNamespace(chain=[Image(file="test-image")]),
+    )
+    await plugin.remember_answer(e, None, response)
+    assert not e.is_stopped()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("contains_at", [False, True])
+async def test_busy_quote_survives_real_decorate_stage_with_global_quote(
+    plugin, monkeypatch, contains_at
+):
+    from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
+    from astrbot.core.star.star import star_map
+    from astrbot.core.star.star_handler import star_handlers_registry
+
+    plugin.context.get_config("")["platform_settings"] = {"reply_with_quote": True}
+    e = await _prepared_proactive(plugin)
+    send = AsyncMock()
+    e.send = send
+    for i in range(3):
+        await plugin.collect(event("群友消息", mid=f"new-{i}"))
+    result = e.plain_result("正常答案")
+    if contains_at:
+        result.chain.insert(0, At(qq="other"))
+    e.set_result(result)
+    handler = SimpleNamespace(
+        handler_module_path=type(plugin).__module__,
+        handler_name="guard_reply",
+        handler=plugin.guard_reply,
+    )
+    monkeypatch.setattr(
+        star_handlers_registry, "get_handlers_by_event_type", lambda *a, **kw: [handler]
+    )
+    assert handler.handler_module_path in star_map
+    stage = ResultDecorateStage()
+    stage.ctx = SimpleNamespace(
+        astrbot_config={"provider_tts_settings": {"enable": False}, "t2i": False},
+        plugin_manager=SimpleNamespace(
+            context=SimpleNamespace(
+                get_using_tts_provider_async=AsyncMock(return_value=None)
+            )
+        ),
+    )
+    stage.content_safe_check_reply = False
+    stage.reply_prefix = ""
+    stage.enable_segmented_reply = False
+    stage.show_reasoning = False
+    stage.reply_with_mention = False
+    stage.reply_with_quote = True
+    stage.forward_threshold = 10000
+    async for _ in stage.process(e):
+        pass
+    await e.send(e.get_result())
+    send.assert_awaited_once()
+    quotes = [part for part in e.get_result().chain if isinstance(part, Reply)]
+    assert len(quotes) == 1 and quotes[0].id == "trigger"
+
+
+@pytest.mark.asyncio
+async def test_busy_quote_after_text_to_image_conversion(plugin, monkeypatch):
+    from astrbot.core.pipeline.result_decorate.stage import (
+        ResultDecorateStage,
+        html_renderer,
+    )
+    from astrbot.core.star.star_handler import star_handlers_registry
+
+    e = await _prepared_proactive(plugin)
+    send = AsyncMock()
+    e.send = send
+    for i in range(3):
+        await plugin.collect(event("群友消息", mid=f"new-{i}"))
+    e.set_result(e.plain_result("需要转成图片的长回答"))
+    handler = SimpleNamespace(
+        handler_module_path=type(plugin).__module__,
+        handler_name="guard_reply",
+        handler=plugin.guard_reply,
+    )
+    monkeypatch.setattr(
+        star_handlers_registry, "get_handlers_by_event_type", lambda *a, **kw: [handler]
+    )
+    render = AsyncMock(return_value="https://example.invalid/rendered.png")
+    monkeypatch.setattr(html_renderer, "render_t2i", render)
+    stage = ResultDecorateStage()
+    stage.ctx = SimpleNamespace(
+        astrbot_config={"provider_tts_settings": {"enable": False}, "t2i": True},
+        plugin_manager=SimpleNamespace(
+            context=SimpleNamespace(
+                get_using_tts_provider_async=AsyncMock(return_value=None)
+            )
+        ),
+    )
+    stage.content_safe_check_reply = False
+    stage.reply_prefix = ""
+    stage.enable_segmented_reply = False
+    stage.show_reasoning = False
+    stage.reply_with_mention = False
+    stage.reply_with_quote = False
+    stage.forward_threshold = 10000
+    stage.t2i_word_threshold = 1
+    stage.t2i_use_network = False
+    stage.t2i_active_template = "default"
+    async for _ in stage.process(e):
+        pass
+    render.assert_awaited_once()
+    assert any(isinstance(part, Image) for part in e.get_result().chain)
+    await e.send(e.get_result())
+    send.assert_awaited_once()
+    assert isinstance(e.get_result().chain[0], Reply)
+    assert e.get_result().chain[0].id == "trigger"
+
+
+@pytest.mark.asyncio
+async def test_busy_quote_after_text_to_speech_conversion(plugin, monkeypatch):
+    from astrbot.core.message.components import Record
+    from astrbot.core.message.message_event_result import ResultContentType
+    from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
+    from astrbot.core.star.star_handler import star_handlers_registry
+
+    e = await _prepared_proactive(plugin)
+    send = AsyncMock()
+    e.send = send
+    for i in range(3):
+        await plugin.collect(event("群友消息", mid=f"new-{i}"))
+    e.set_result(
+        e.plain_result("正常语音答案").set_result_content_type(
+            ResultContentType.LLM_RESULT
+        )
+    )
+    handler = SimpleNamespace(
+        handler_module_path=type(plugin).__module__,
+        handler_name="guard_reply",
+        handler=plugin.guard_reply,
+    )
+    monkeypatch.setattr(
+        star_handlers_registry, "get_handlers_by_event_type", lambda *a, **kw: [handler]
+    )
+    monkeypatch.setattr(
+        SessionServiceManager,
+        "should_process_tts_request",
+        AsyncMock(return_value=True),
+    )
+    tts = SimpleNamespace(get_audio=AsyncMock(return_value="/tmp/fake-voice.wav"))
+    stage = ResultDecorateStage()
+    stage.ctx = SimpleNamespace(
+        astrbot_config={
+            "provider_tts_settings": {
+                "enable": True,
+                "use_file_service": False,
+                "dual_output": False,
+            },
+            "callback_api_base": "",
+            "t2i": False,
+        },
+        plugin_manager=SimpleNamespace(
+            context=SimpleNamespace(
+                get_using_tts_provider_async=AsyncMock(return_value=tts)
+            )
+        ),
+    )
+    stage.content_safe_check_reply = False
+    stage.reply_prefix = ""
+    stage.enable_segmented_reply = False
+    stage.show_reasoning = False
+    stage.tts_trigger_probability = 1
+    stage.reply_with_mention = False
+    stage.reply_with_quote = True
+    stage.forward_threshold = 10000
+    async for _ in stage.process(e):
+        pass
+    tts.get_audio.assert_awaited_once()
+    assert any(isinstance(part, Record) for part in e.get_result().chain)
+    await e.send(e.get_result())
+    send.assert_awaited_once()
+    assert isinstance(e.get_result().chain[0], Reply)
+    assert e.get_result().chain[0].id == "trigger"

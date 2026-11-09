@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "fastbrain-proactive-v0.1.12"
+VERSION = "fastbrain-proactive-v0.1.13"
 COLUMNS = [
     "id",
     "seconds_relative_to_target",
@@ -96,6 +96,9 @@ class Dataset:
         action,
         elapsed_ms,
         queue_ms,
+        gate_tier=None,
+        gate_threshold=None,
+        direct_interaction=False,
     ):
         state = json.loads(payload["state"])
         identity = message_id or (received_at, state["target"])
@@ -127,6 +130,9 @@ class Dataset:
                     action,
                     elapsed_ms,
                     queue_ms,
+                    gate_tier,
+                    gate_threshold,
+                    direct_interaction,
                 )
                 c.execute(
                     "INSERT INTO samples VALUES(?,?,?)",
@@ -163,6 +169,9 @@ class Dataset:
         action,
         elapsed_ms,
         queue_ms,
+        gate_tier,
+        gate_threshold,
+        direct_interaction,
     ):
         state = json.loads(payload["state"])
         visible = state["history"] + [state["target"]]
@@ -303,6 +312,11 @@ class Dataset:
             "p_true": probability,
             "threshold": threshold,
             "decision": training["label"],
+            "gate_tier": gate_tier,
+            "gate_threshold": threshold if gate_threshold is None else gate_threshold,
+            "gate_decision": probability
+            >= (threshold if gate_threshold is None else gate_threshold),
+            "direct_interaction": direct_interaction,
             "action": action,
             "sample_probability": 1.0 if training["label"] else self.rate,
             "false_sample_rate": self.rate,
