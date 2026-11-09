@@ -26,8 +26,8 @@ from .engine import (
     Rooms,
     Settings,
     build_payload,
-    choose_gate,
     compact,
+    direct_interaction,
 )
 from .image_captions import CAPTIONS, ImageCaptionBridge, caption_text
 
@@ -37,7 +37,6 @@ ANSWER = "fastbrain_proactive_answer_v1"
 SENT = "fastbrain_proactive_sent_v1"
 JUDGED = "fastbrain_proactive_judged_v1"
 SAMPLE = "fastbrain_proactive_sample_v1"
-SEND_GUARD = "fastbrain_proactive_send_guard_v1"
 MAX_DECISION_AGE = 30.0
 
 
@@ -168,8 +167,11 @@ class FastBrainProactive(Star):
         if not room.add(sender, text or "[无正文文字]", mid, now, self.cfg, routing):
             return
         own = room.is_self(sender, self_id)
-        if event.is_at_or_wake_command or own:
-            room.cooldown_until = max(room.cooldown_until, now + self.cfg.cooldown)
+        if event.is_at_or_wake_command and not own:
+            room.extend_cooldown(now + self.cfg.cooldown, "passive")
+        elif own:
+            source = room.cooldown_source if now < room.cooldown_until else "unknown"
+            room.extend_cooldown(now + self.cfg.cooldown, source)
         # Only actual passive handling excludes an event, not @/reply syntax.
         eligible = (
             bool(text or has_routing)
@@ -186,7 +188,6 @@ class FastBrainProactive(Star):
                 "received_at": time.time(),
                 "rows": tuple(room.messages) if eligible else (),
                 "self_ids": set(room.self_ids),
-                "revision": room.revision,
             },
         )
 
@@ -333,7 +334,7 @@ class FastBrainProactive(Star):
                 self_ids=set(captured.get("self_ids", ())),
             )
             payload, state = build_payload(self.cfg, snapshot, str(event.get_self_id()))
-            gate = choose_gate(self.cfg, json.loads(state))
+            direct = direct_interaction(json.loads(state), self.cfg.names)
         except ValueError:
             self.note_skip(event, room, "input_budget")
             return
@@ -341,6 +342,7 @@ class FastBrainProactive(Star):
         acquired = False
         p = None
         action = "interrupted_after_decision"
+        cooldown_exempt = False
         try:
             if queued < self.blocked_until:
                 self.note_skip(event, room, "error_backoff")
@@ -375,32 +377,25 @@ class FastBrainProactive(Star):
                 action = "decision_expired"
                 self.note_skip(event, room, action)
                 return
-            accepted = p >= gate.threshold
-            action = (
-                "tier_threshold_block"
-                if p >= self.cfg.threshold and not accepted
-                else "silent"
-            )
+            accepted = p >= self.cfg.threshold
+            action = "silent"
             if accepted:
                 if self.cfg.mode == "observe":
                     action = "would_reply"
-                elif now < room.pending_until and not (
-                    gate.direct
-                    and room.pending_tier == "cold_start"
-                    and self.supersede_pending(room)
-                ):
+                elif now < room.pending_until:
                     action = "reply_pending"
-                elif now < room.cooldown_until and not gate.direct:
+                elif now < room.cooldown_until and not (
+                    direct and room.cooldown_source == "ordinary"
+                ):
                     action = "reply_cooldown"
                 else:
-                    if room.pending_until and now >= room.pending_until:
-                        self.supersede_pending(room)
                     action = "reply_reserved"
-                    room.cooldown_until = now + self.cfg.cooldown
+                    cooldown_exempt = now < room.cooldown_until and direct
+                    room.extend_cooldown(
+                        now + self.cfg.cooldown, "direct" if direct else "ordinary"
+                    )
                     room.pending_until = now + 300
                     room.pending_owner = id(event)
-                    room.pending_tier = gate.tier
-                    room.pending_event = event
                     event.set_extra(
                         DECISION,
                         {
@@ -408,14 +403,10 @@ class FastBrainProactive(Star):
                             "state": state,
                             "created": now,
                             "injected": False,
-                            "revision": captured["revision"],
-                            "direct": gate.direct,
-                            "tier": gate.tier,
-                            "superseded": False,
+                            "direct": direct,
                         },
                     )
-                    # Pre-send safety and freshness checks cannot inspect
-                    # already-sent streaming frames. Limit this to proactive replies.
+                    # Error suppression needs a pre-send result, not streamed frames.
                     event.set_extra("enable_streaming", False)
                     event.is_at_or_wake_command = True
             room.last = {
@@ -426,21 +417,22 @@ class FastBrainProactive(Star):
                 "mode": self.cfg.mode,
                 "scheduler_queue_ms": getattr(self.client, "last_queue_ms", 0),
                 "request_ms": getattr(self.client, "last_request_ms", 0),
-                "gate_tier": gate.tier,
-                "gate_threshold": gate.threshold,
+                "direct_interaction": direct,
+                "cooldown_exempt": cooldown_exempt,
             }
             logger.info(
                 "FastBrain proactive decision: scope=%s message_id=%s p_true=%.6f "
-                "inference_ms=%s queue_ms=%s scheduler_queue_ms=%s tier=%s threshold=%.3f action=%s",
+                "inference_ms=%s queue_ms=%s scheduler_queue_ms=%s action=%s "
+                "direct=%s cooldown_exempt=%s",
                 self.scope(event),
                 str(event.message_obj.message_id)[:128],
                 p,
                 room.last["elapsed_ms"],
                 room.last["queue_ms"],
                 room.last["scheduler_queue_ms"],
-                gate.tier,
-                gate.threshold,
                 action,
+                direct,
+                cooldown_exempt,
             )
         except asyncio.TimeoutError:
             self.note_skip(event, room, "queue_timeout")
@@ -471,15 +463,11 @@ class FastBrainProactive(Star):
                         action=action,
                         elapsed_ms=round((finished - started) * 1000),
                         queue_ms=round((started - queued) * 1000),
-                        gate_tier=gate.tier,
-                        gate_threshold=gate.threshold,
-                        direct_interaction=gate.direct,
+                        direct_interaction=direct,
+                        cooldown_exempt=cooldown_exempt,
                     )
                     event.set_extra(SAMPLE, rid)
                     self.dataset_error = ""
-                    old_decision = event.get_extra(DECISION)
-                    if old_decision and old_decision.get("superseded"):
-                        await self.capture_outcome(event, "superseded_by_interaction")
                 except Exception as exc:
                     self.capture_error(exc)
 
@@ -505,26 +493,6 @@ class FastBrainProactive(Star):
             "FastBrain proactive skipped: scope=%s reason=%s", self.scope(event), reason
         )
 
-    @staticmethod
-    def release_pending(room: Room, event: AstrMessageEvent) -> None:
-        if room.pending_owner == id(event):
-            room.pending_until = 0
-            room.pending_owner = 0
-            room.pending_tier = ""
-            room.pending_event = None
-
-    def supersede_pending(self, room: Room) -> bool:
-        """Invalidate only the particular proactive event, never a whole session."""
-        old = room.pending_event
-        decision = old.get_extra(DECISION) if old is not None else None
-        if not decision:
-            return False
-        decision["superseded"] = True
-        old.stop_event()
-        if old.get_extra(SAMPLE):
-            asyncio.create_task(self.capture_outcome(old, "superseded_by_interaction"))
-        return True
-
     def valid(self, event: AstrMessageEvent, room: Room) -> bool:
         return (
             self.allowed(event)
@@ -545,12 +513,8 @@ class FastBrainProactive(Star):
         if not decision:
             if self.allowed(event) and event.get_extra(SEEN):
                 room = self.rooms.get(self.key(event))
-                if room.pending_tier == "cold_start":
-                    self.supersede_pending(room)
                 room.pending_until = self.clock() + 300
                 room.pending_owner = id(event)
-                room.pending_tier = "passive"
-                room.pending_event = event
             return
         if decision["injected"]:
             return
@@ -559,13 +523,13 @@ class FastBrainProactive(Star):
             not self.allowed(event)
             or self.rooms.items.get(self.key(event)) is not room
             or room.pending_owner != id(event)
-            or decision.get("superseded", False)
             or self.clock() - decision["created"] > 30
             or event.call_llm
             or event._has_send_oper
         )
         if stale:
-            self.release_pending(room, event)
+            if room.pending_owner == id(event):
+                room.pending_until = 0
             room.last = {"status": "stale_before_generation"}
             await self.capture_outcome(event, "stale_before_generation")
             event.stop_event()
@@ -582,7 +546,6 @@ class FastBrainProactive(Star):
             ).mark_as_temp()
         )
         decision["injected"] = True
-        decision["generation_started"] = self.clock()
         await self.capture_outcome(event, "generation_started")
 
     @filter.on_agent_done()
@@ -593,142 +556,52 @@ class FastBrainProactive(Star):
             return
         room = self.rooms.get(self.key(event))
         decision = event.get_extra(DECISION)
-        if decision:
-            decision["generation_finished"] = self.clock()
-        if not decision and room.pending_owner == id(event):
-            self.release_pending(room, event)
-            room.cooldown_until = max(
-                room.cooldown_until, self.clock() + self.cfg.cooldown
-            )
-        text = getattr(response, "completion_text", "") or ""
-        response_chain = (
-            getattr(getattr(response, "result_chain", None), "chain", []) or []
-        )
-        empty_response = (
-            not text.strip() and not response_chain and not event._has_send_oper
-        )
-        if decision and (
-            getattr(response, "role", "") == "err" or response is None or empty_response
-        ):
-            decision["model_error"] = (
-                getattr(response, "role", "") == "err" or response is None
-            )
-            self.release_pending(room, event)
+        if decision and (response is None or getattr(response, "role", "") == "err"):
+            if room.pending_owner == id(event):
+                room.pending_until = 0
             event.clear_result()
             event.stop_event()
-            await self.capture_outcome(
-                event,
-                "model_error_suppressed"
-                if decision["model_error"]
-                else "empty_response_suppressed",
-            )
+            await self.capture_outcome(event, "model_error_suppressed")
             return
+        if room.pending_owner == id(event):
+            room.pending_until = 0
+            source = (
+                "direct"
+                if decision and decision["direct"]
+                else "ordinary"
+                if decision
+                else "passive"
+            )
+            room.extend_cooldown(self.clock() + self.cfg.cooldown, source)
+        text = getattr(response, "completion_text", "")
         if text:
             event.set_extra(ANSWER, text[: self.cfg.max_bytes])
         await self.capture_outcome(event, "generation_completed")
         # Streaming responses may already have been sent before this hook.
         if event._has_send_oper:
             self.record_sent(event)
-            self.release_pending(room, event)
             await self.capture_outcome(event, "send_hook_observed")
 
     @filter.on_decorating_result(priority=-10000)
-    async def guard_reply(self, event: AstrMessageEvent) -> None:
-        """Drop obsolete/error proactive output and quote busy-group replies."""
-        decision = event.get_extra(DECISION)
-        if not decision:
+    async def suppress_model_error(self, event: AstrMessageEvent) -> None:
+        """Do not post upstream error messages for proactive replies."""
+        if not event.get_extra(DECISION):
             return
-        room = decision["room"]
         result = event.get_result()
-        if result is None:
+        if not result or not result.chain:
             return
         text = "".join(c.text for c in result.chain if isinstance(c, Plain)).strip()
-        error_text = text.startswith(
+        if not text.startswith(
             ("LLM 响应错误:", "LLM 响应错误：", "All chat models failed:")
-        )
-        meaningful = any(
-            not isinstance(c, (Plain, At, AtAll, Reply))
-            or (isinstance(c, Plain) and bool(c.text.strip()))
-            for c in result.chain
-        )
-        new_messages = max(0, room.revision - decision["revision"])
-        started = decision.get("generation_started", decision["created"])
-        finished = decision.get("generation_finished", self.clock())
-        too_old = (
-            finished - started > 60 and new_messages >= 20 and not decision["direct"]
-        )
-        reason = None
-        if (
-            not self.allowed(event)
-            or decision.get("superseded")
-            or self.rooms.items.get(self.key(event)) is not room
         ):
-            reason = "superseded_before_send"
-        elif decision.get("model_error") or error_text or not meaningful:
-            reason = (
-                "model_error_suppressed"
-                if decision.get("model_error") or error_text
-                else "empty_response_suppressed"
-            )
-        elif too_old:
-            reason = "stale_after_generation"
-        if reason:
-            self.release_pending(room, event)
-            room.last = {"status": reason, "new_messages": new_messages}
-            event.clear_result()
-            event.stop_event()
-            await self.capture_outcome(event, reason)
             return
-        self.install_send_guard(event, decision)
-
-    def install_send_guard(self, event: AstrMessageEvent, decision: dict) -> None:
-        """Add the reference after core TTS/text-to-image transformations."""
-        if event.get_extra(SEND_GUARD):
-            return
-        original_send = event.send
-
-        async def guarded_send(message):
-            if message is None:
-                return await original_send(message)
-            room = decision["room"]
-            new_messages = max(0, room.revision - decision["revision"])
-            started = decision.get("generation_started", decision["created"])
-            finished = decision.get("generation_finished", self.clock())
-            too_old = (
-                finished - started > 60
-                and new_messages >= 20
-                and not decision["direct"]
-            )
-            if (
-                not self.allowed(event)
-                or event.is_stopped()
-                or decision.get("superseded")
-                or self.rooms.items.get(self.key(event)) is not room
-                or too_old
-            ):
-                self.release_pending(room, event)
-                event.stop_event()
-                await self.capture_outcome(
-                    event, "stale_at_send" if too_old else "superseded_before_send"
-                )
-                return None
-            message_id = str(getattr(event.message_obj, "message_id", "") or "")
-            chain = getattr(message, "chain", None)
-            if (
-                new_messages >= 3
-                and message_id
-                and chain
-                and not any(
-                    isinstance(c, Reply) and str(c.id) == message_id for c in chain
-                )
-            ):
-                chain[:] = [c for c in chain if not isinstance(c, Reply)]
-                chain.insert(0, Reply(id=message_id))
-                await self.capture_outcome(event, "busy_group_quote_added")
-            return await original_send(message)
-
-        event.send = guarded_send
-        event.set_extra(SEND_GUARD, True)
+        decision = event.get_extra(DECISION)
+        room = decision["room"]
+        if room.pending_owner == id(event):
+            room.pending_until = 0
+        event.clear_result()
+        event.stop_event()
+        await self.capture_outcome(event, "model_error_suppressed")
 
     def record_sent(self, event: AstrMessageEvent) -> None:
         if (
@@ -750,15 +623,21 @@ class FastBrainProactive(Star):
             self_id = str(event.get_self_id())
             room.remember_self(self_id)
             room.add(self_id, text, "", now, self.cfg)
-            room.cooldown_until = max(room.cooldown_until, now + self.cfg.cooldown)
+            decision = event.get_extra(DECISION)
+            source = (
+                "direct"
+                if decision and decision["direct"]
+                else "ordinary"
+                if decision
+                else "passive"
+            )
+            room.extend_cooldown(now + self.cfg.cooldown, source)
             event.set_extra(SENT, True)
 
     @filter.after_message_sent()
     async def after_sent(self, event: AstrMessageEvent) -> None:
         self.record_sent(event)
         if event._has_send_oper:
-            if decision := event.get_extra(DECISION):
-                self.release_pending(decision["room"], event)
             await self.capture_outcome(event, "send_hook_observed")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -772,8 +651,7 @@ class FastBrainProactive(Star):
         yield event.plain_result(
             f"FastBrain 主动回复：{self.cfg.mode}\n"
             f"群配置值：{self.scope(event)}\nUMO：{event.unified_msg_origin}\n"
-            f"本群启用：{self.allowed(event)}；互动/冷启动/定向他人阈值："
-            f"{self.cfg.threshold}/{self.cfg.cold_start_threshold}/{self.cfg.directed_other_threshold}\n"
+            f"本群启用：{self.allowed(event)}；阈值：{self.cfg.threshold}\n"
             f"上下文：{len(room.messages) if room else 0} 条；最近判断：{last}\n"
             f"数据集：{bool(self.dataset)}；False 抽样：{self.cfg.false_sample_rate:.0%}；写入错误：{self.dataset_error or '无'}"
         )
