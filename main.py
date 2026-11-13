@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import time
+import weakref
 from sys import maxsize
 from collections import deque
 from collections.abc import AsyncGenerator
@@ -22,6 +23,7 @@ from .dataset import Dataset
 from .client import DecisionError, SystemOneClient
 from .engine import (
     RAW_MENTION_RE,
+    PendingReply,
     Room,
     Rooms,
     Settings,
@@ -188,8 +190,87 @@ class FastBrainProactive(Star):
                 "received_at": time.time(),
                 "rows": tuple(room.messages) if eligible else (),
                 "self_ids": set(room.self_ids),
+                # collect runs in the pipeline task, before hooks may use child tasks.
+                "pipeline_task": weakref.ref(asyncio.current_task()),
             },
         )
+
+    @staticmethod
+    def stopped(event: AstrMessageEvent) -> bool:
+        return event.is_stopped() or bool(event.get_extra("agent_stop_requested"))
+
+    def release_pending(
+        self, room: Room, owner: int, reason: str, expected: PendingReply | None = None
+    ) -> bool:
+        entry = room.pending.get(owner)
+        if entry is None or (expected is not None and entry is not expected):
+            return False
+        room.pending.pop(owner)
+        task = entry.task() if entry.task else None
+        if task is not None and entry.done_callback is not None:
+            task.remove_done_callback(entry.done_callback)
+        event = entry.event()
+        logger.info(
+            "FastBrain reply released: scope=%s message_id=%s reason=%s "
+            "age_ms=%s remaining=%s",
+            self.scope(event) if event else "expired_event",
+            entry.message_id,
+            reason,
+            round((self.clock() - entry.started) * 1000),
+            len(room.pending),
+        )
+        return True
+
+    def prune_pending(self, room: Room) -> None:
+        for owner, entry in list(room.pending.items()):
+            event = entry.event()
+            task = entry.task() if entry.task else None
+            reason = None
+            if event is None:
+                reason = "event_released"
+            elif self.stopped(event):
+                reason = "stop_requested"
+            elif entry.task is not None and (task is None or task.done()):
+                reason = "pipeline_finished"
+            elif entry.task is None and self.clock() >= entry.deadline:
+                reason = "untracked_timeout"
+            if reason:
+                self.release_pending(room, owner, reason, entry)
+
+    def reserve_pending(self, event: AstrMessageEvent, room: Room, phase: str) -> bool:
+        self.prune_pending(room)
+        if self.stopped(event):
+            return False
+        owner = id(event)
+        if phase == "passive":
+            # Passive handling may take an unstarted reservation, not a live reply.
+            for previous, entry in list(room.pending.items()):
+                if entry.phase == "reserved" and previous != owner:
+                    self.release_pending(room, previous, "passive_takeover", entry)
+        if owner in room.pending:
+            room.pending[owner].phase = phase
+            return True
+        now = self.clock()
+        task_ref = (event.get_extra(SEEN) or {}).get("pipeline_task")
+        task = task_ref() if task_ref else None
+        if task_ref is not None and (task is None or task.done()):
+            return False
+        entry = PendingReply(
+            event=weakref.ref(event), task=task_ref, started=now, deadline=now + 300,
+            phase=phase, message_id=str(event.message_obj.message_id or "")[:128],
+        )
+        room.pending[owner] = entry
+        if task is not None:
+            def completed(_task):
+                self.release_pending(room, owner, "pipeline_finished", entry)
+
+            entry.done_callback = completed
+            task.add_done_callback(completed)
+        logger.info(
+            "FastBrain reply reserved: scope=%s message_id=%s phase=%s pending=%s",
+            self.scope(event), entry.message_id, phase, len(room.pending),
+        )
+        return True
 
     @staticmethod
     def _raw_containers(raw_msg: Any) -> list[Any]:
@@ -379,23 +460,25 @@ class FastBrainProactive(Star):
                 return
             accepted = p >= self.cfg.threshold
             action = "silent"
+            self.prune_pending(room)
             if accepted:
                 if self.cfg.mode == "observe":
                     action = "would_reply"
-                elif now < room.pending_until:
+                elif room.pending:
                     action = "reply_pending"
                 elif now < room.cooldown_until and not (
                     direct and room.cooldown_source == "ordinary"
                 ):
                     action = "reply_cooldown"
                 else:
+                    if not self.reserve_pending(event, room, "reserved"):
+                        action = "cancelled_or_handled"
+                        return
                     action = "reply_reserved"
                     cooldown_exempt = now < room.cooldown_until and direct
                     room.extend_cooldown(
                         now + self.cfg.cooldown, "direct" if direct else "ordinary"
                     )
-                    room.pending_until = now + 300
-                    room.pending_owner = id(event)
                     event.set_extra(
                         DECISION,
                         {
@@ -419,11 +502,13 @@ class FastBrainProactive(Star):
                 "request_ms": getattr(self.client, "last_request_ms", 0),
                 "direct_interaction": direct,
                 "cooldown_exempt": cooldown_exempt,
+                "pending_count": len(room.pending),
+                "pending_message_ids": [e.message_id for e in room.pending.values()],
             }
             logger.info(
                 "FastBrain proactive decision: scope=%s message_id=%s p_true=%.6f "
                 "inference_ms=%s queue_ms=%s scheduler_queue_ms=%s action=%s "
-                "direct=%s cooldown_exempt=%s",
+                "direct=%s cooldown_exempt=%s pending_count=%s pending_message_ids=%s",
                 self.scope(event),
                 str(event.message_obj.message_id)[:128],
                 p,
@@ -433,6 +518,8 @@ class FastBrainProactive(Star):
                 action,
                 direct,
                 cooldown_exempt,
+                room.last["pending_count"],
+                compact(room.last["pending_message_ids"]),
             )
         except asyncio.TimeoutError:
             self.note_skip(event, room, "queue_timeout")
@@ -497,7 +584,7 @@ class FastBrainProactive(Star):
         return (
             self.allowed(event)
             and self.rooms.items.get(self.key(event)) is room
-            and not event.is_stopped()
+            and not self.stopped(event)
             and not event.is_at_or_wake_command
             and not event.call_llm
             and not event._has_send_oper
@@ -510,11 +597,15 @@ class FastBrainProactive(Star):
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
         decision = event.get_extra(DECISION)
+        captured = event.get_extra(SEEN)
+        if captured and self.stopped(event):
+            self.release_pending(captured["room"], id(event), "stop_requested")
+            return
         if not decision:
-            if self.allowed(event) and event.get_extra(SEEN):
-                room = self.rooms.get(self.key(event))
-                room.pending_until = self.clock() + 300
-                room.pending_owner = id(event)
+            if self.allowed(event) and captured:
+                room = captured["room"]
+                if self.rooms.items.get(self.key(event)) is room:
+                    self.reserve_pending(event, room, "passive")
             return
         if decision["injected"]:
             return
@@ -522,14 +613,13 @@ class FastBrainProactive(Star):
         stale = (
             not self.allowed(event)
             or self.rooms.items.get(self.key(event)) is not room
-            or room.pending_owner != id(event)
+            or id(event) not in room.pending
             or self.clock() - decision["created"] > 30
             or event.call_llm
             or event._has_send_oper
         )
         if stale:
-            if room.pending_owner == id(event):
-                room.pending_until = 0
+            self.release_pending(room, id(event), "stale_before_generation")
             room.last = {"status": "stale_before_generation"}
             await self.capture_outcome(event, "stale_before_generation")
             event.stop_event()
@@ -546,25 +636,27 @@ class FastBrainProactive(Star):
             ).mark_as_temp()
         )
         decision["injected"] = True
+        room.pending[id(event)].phase = "generating"
         await self.capture_outcome(event, "generation_started")
 
     @filter.on_agent_done()
     async def remember_answer(
         self, event: AstrMessageEvent, run_context: Any, response: LLMResponse
     ) -> None:
-        if not self.allowed(event) or not event.get_extra(SEEN):
+        captured = event.get_extra(SEEN)
+        if not captured:
             return
-        room = self.rooms.get(self.key(event))
+        room = captured["room"]
+        released = self.release_pending(room, id(event), "agent_done")
+        if not self.allowed(event) or self.rooms.items.get(self.key(event)) is not room:
+            return
         decision = event.get_extra(DECISION)
         if decision and (response is None or getattr(response, "role", "") == "err"):
-            if room.pending_owner == id(event):
-                room.pending_until = 0
             event.clear_result()
             event.stop_event()
             await self.capture_outcome(event, "model_error_suppressed")
             return
-        if room.pending_owner == id(event):
-            room.pending_until = 0
+        if released and not self.stopped(event):
             source = (
                 "direct"
                 if decision and decision["direct"]
@@ -597,8 +689,7 @@ class FastBrainProactive(Star):
             return
         decision = event.get_extra(DECISION)
         room = decision["room"]
-        if room.pending_owner == id(event):
-            room.pending_until = 0
+        self.release_pending(room, id(event), "model_error_suppressed")
         event.clear_result()
         event.stop_event()
         await self.capture_outcome(event, "model_error_suppressed")
@@ -646,6 +737,8 @@ class FastBrainProactive(Star):
         self, event: AstrMessageEvent
     ) -> AsyncGenerator[MessageEventResult, None]:
         room = self.rooms.items.get(self.key(event))
+        if room:
+            self.prune_pending(room)
         last = compact(room.last) if room else "尚无记录"
         event.set_extra(SENT, True)
         yield event.plain_result(
@@ -653,6 +746,7 @@ class FastBrainProactive(Star):
             f"群配置值：{self.scope(event)}\nUMO：{event.unified_msg_origin}\n"
             f"本群启用：{self.allowed(event)}；阈值：{self.cfg.threshold}\n"
             f"上下文：{len(room.messages) if room else 0} 条；最近判断：{last}\n"
+            f"正在回复：{len(room.pending) if room else 0} 条\n"
             f"数据集：{bool(self.dataset)}；False 抽样：{self.cfg.false_sample_rate:.0%}；写入错误：{self.dataset_error or '无'}"
         )
         event.stop_event()
@@ -662,7 +756,10 @@ class FastBrainProactive(Star):
     async def clear(
         self, event: AstrMessageEvent
     ) -> AsyncGenerator[MessageEventResult, None]:
-        self.rooms.items.pop(self.key(event), None)
+        room = self.rooms.items.pop(self.key(event), None)
+        if room:
+            for owner in list(room.pending):
+                self.release_pending(room, owner, "buffer_cleared")
         event.set_extra(SENT, True)
         yield event.plain_result(
             "已清空本群主动回复缓冲，并使尚未开始生成的旧判断失效。"
@@ -672,5 +769,8 @@ class FastBrainProactive(Star):
     async def terminate(self) -> None:
         self.closed = True
         self.caption_bridge.close()
+        for room in self.rooms.items.values():
+            for owner in list(room.pending):
+                self.release_pending(room, owner, "plugin_unloaded")
         self.rooms.items.clear()
         await self.client.close()

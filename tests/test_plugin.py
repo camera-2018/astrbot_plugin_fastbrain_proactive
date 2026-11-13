@@ -1389,3 +1389,161 @@ async def test_new_messages_do_not_drop_or_modify_completed_output(plugin):
     await plugin.suppress_model_error(e)
     assert not e.is_stopped()
     assert e.get_result().chain == [Plain("普通回复")]
+
+
+@pytest.mark.asyncio
+async def test_stopped_queued_passive_request_does_not_reserve_or_cool_down(plugin):
+    e = event("睦头，排队中的问题", mid="stopped-queued")
+    e.is_at_or_wake_command = True
+    await plugin.collect(e)
+    room = plugin.rooms.get(plugin.key(e))
+    from astrbot.core.utils.active_event_registry import active_event_registry
+
+    active_event_registry.register(e)
+    try:
+        active_event_registry.request_agent_stop_all(e.unified_msg_origin)
+        plugin.clock = lambda: 1100
+        await plugin.prepare_reply(e, ProviderRequest())
+        assert room.pending_until == 0
+        await plugin.remember_answer(
+            e, None, SimpleNamespace(role="assistant", completion_text="Output stopped.")
+        )
+        assert room.cooldown_until == 1030
+        next_event = event("睦头帮我看看", mid="after-stop")
+        await plugin.collect(next_event)
+        await plugin.judge(next_event)
+        assert next_event.get_extra(DECISION)
+    finally:
+        active_event_registry.unregister(e)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_kind", ["normal", "exception", "cancel"])
+async def test_pipeline_exit_releases_reservation_without_agent_done(plugin, exit_kind):
+    ready, finish = asyncio.Event(), asyncio.Event()
+    e = event(mid="pipeline")
+
+    async def pipeline():
+        await plugin.collect(e)
+        await plugin.judge(e)
+        await plugin.prepare_reply(e, ProviderRequest())
+        ready.set()
+        await finish.wait()
+        if exit_kind == "exception":
+            raise RuntimeError("failure after request hook")
+
+    task = asyncio.create_task(pipeline())
+    await ready.wait()
+    room = plugin.rooms.get(plugin.key(e))
+    assert room.pending_until > plugin.clock()
+    if exit_kind == "cancel":
+        task.cancel()
+    else:
+        finish.set()
+    await asyncio.gather(task, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert room.pending_until == 0
+    plugin.clock = lambda: 1031
+    next_event = event(mid="next")
+    await plugin.collect(next_event)
+    await plugin.judge(next_event)
+    assert next_event.get_extra(DECISION)
+
+
+@pytest.mark.asyncio
+async def test_active_reply_does_not_expire_after_five_minutes(plugin):
+    ready, finish = asyncio.Event(), asyncio.Event()
+    e = event(mid="slow")
+
+    async def pipeline():
+        await plugin.collect(e)
+        await plugin.judge(e)
+        await plugin.prepare_reply(e, ProviderRequest())
+        ready.set()
+        await finish.wait()
+
+    task = asyncio.create_task(pipeline())
+    try:
+        await ready.wait()
+        plugin.clock = lambda: 1400
+        other = event(mid="other")
+        await plugin.collect(other)
+        await plugin.judge(other)
+        assert plugin.rooms.get(plugin.key(e)).last["status"] == "reply_pending"
+        assert not other.get_extra(DECISION)
+    finally:
+        finish.set()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_concurrent_passive_replies_release_only_their_own_entry(plugin):
+    ready = [asyncio.Event(), asyncio.Event()]
+    finish = [asyncio.Event(), asyncio.Event()]
+    events = [event(mid="older"), event(mid="newer")]
+
+    async def pipeline(i):
+        e = events[i]
+        e.is_at_or_wake_command = True
+        await plugin.collect(e)
+        await plugin.prepare_reply(e, ProviderRequest())
+        await plugin.prepare_reply(e, ProviderRequest())  # Idempotent hook.
+        ready[i].set()
+        await finish[i].wait()
+
+    tasks = [asyncio.create_task(pipeline(i)) for i in range(2)]
+    try:
+        await asyncio.gather(*(r.wait() for r in ready))
+        room = plugin.rooms.get(plugin.key(events[0]))
+        assert len(room.pending) == 2
+        finish[1].set()
+        await tasks[1]
+        await asyncio.sleep(0)
+        assert set(room.pending) == {id(events[0])}
+        plugin.clock = lambda: 1031
+        other = event(mid="blocked")
+        await plugin.collect(other)
+        await plugin.judge(other)
+        assert room.last["status"] == "reply_pending"
+        finish[0].set()
+        await tasks[0]
+        await asyncio.sleep(0)
+        assert not room.pending
+    finally:
+        for f in finish:
+            f.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_stopped_active_owner_does_not_remove_newer_reservation(plugin):
+    ready, finish = asyncio.Event(), asyncio.Event()
+    old = event(mid="old-pipeline")
+
+    async def pipeline():
+        await plugin.collect(old)
+        await plugin.judge(old)
+        await plugin.prepare_reply(old, ProviderRequest())
+        ready.set()
+        await finish.wait()
+
+    task = asyncio.create_task(pipeline())
+    try:
+        await ready.wait()
+        old.set_extra("agent_stop_requested", True)
+        plugin.clock = lambda: 1031
+        new = event(mid="new-pipeline")
+        await plugin.collect(new)
+        await plugin.judge(new)
+        room = plugin.rooms.get(plugin.key(new))
+        assert set(room.pending) == {id(new)}
+        finish.set()
+        await task
+        await asyncio.sleep(0)
+        await plugin.remember_answer(
+            old, None, SimpleNamespace(role="assistant", completion_text="")
+        )
+        assert set(room.pending) == {id(new)}
+    finally:
+        finish.set()
+        await task

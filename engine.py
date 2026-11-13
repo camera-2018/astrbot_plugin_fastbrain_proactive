@@ -8,6 +8,7 @@ from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping
 from typing import Any
 from dataclasses import dataclass, field
+from weakref import ReferenceType
 
 RAW_MENTION_RE = re.compile(r"<@!?([^\s<>]{1,128})>")
 
@@ -150,6 +151,17 @@ class Settings:
 
 
 @dataclass
+class PendingReply:
+    event: ReferenceType
+    task: ReferenceType | None
+    started: float
+    deadline: float
+    phase: str
+    message_id: str
+    done_callback: Callable | None = None
+
+
+@dataclass
 class Room:
     messages: deque = field(default_factory=deque)
     seen: OrderedDict = field(default_factory=OrderedDict)
@@ -158,9 +170,13 @@ class Room:
     cooldown_until: float = 0
     cooldown_source: str = "unknown"
     last: dict = field(default_factory=dict)
-    pending_until: float = 0
-    pending_owner: int = 0
+    pending: dict[int, PendingReply] = field(default_factory=dict)
     self_ids: set[str] = field(default_factory=set)
+
+    @property
+    def pending_until(self) -> float:
+        """Diagnostic deadline; live task ownership determines whether we are busy."""
+        return max((entry.deadline for entry in self.pending.values()), default=0)
 
     def extend_cooldown(self, until: float, source: str) -> None:
         if until >= self.cooldown_until:
